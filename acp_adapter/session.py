@@ -463,6 +463,7 @@ class SessionManager:
             return self._agent_factory()
 
         from run_agent import AIAgent
+        from agent.skill_utils import parse_config_string_list
         from hermes_cli.config import load_config
         from hermes_cli.runtime_provider import resolve_runtime_provider
         from hermes_constants import resolve_reasoning_config
@@ -485,7 +486,9 @@ class SessionManager:
             "platform": "acp", "quiet_mode": True, "session_id": session_id, "session_db": self._get_db(),
             "enabled_toolsets": (list(enabled_toolsets) if enabled_toolsets is not None
                                  else _expand_acp_enabled_toolsets(["hermes-acp"], mcp_server_names=configured_mcp_servers)),
-            "disabled_toolsets": list(disabled_toolsets) if disabled_toolsets is not None else None,
+            # agent.disabled_toolsets is subtracted at tool granularity by the agent, as on the CLI/gateway/cron.
+            "disabled_toolsets": (list(disabled_toolsets) if disabled_toolsets is not None
+                                  else parse_config_string_list((config.get("agent") or {}).get("disabled_toolsets")) or None),
             "model": model or default_model,
             "cwd": cwd,
             # Same chokepoint as the CLI/gateway/TUI/cron: without it ``agent.reasoning_effort: none`` never
