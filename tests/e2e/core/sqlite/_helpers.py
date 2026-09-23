@@ -1,11 +1,19 @@
 """Harness for the multi-process SQLite torture chamber (issue class C1: state.db integrity).
 
-One real ``state.db`` in WAL mode under ``tmp_path``; every role is a separate OS process running
-``_roles.py`` against it (see that module for the journal/report protocol). This module owns:
+One real ``state.db`` under ``tmp_path``, in either journal mode Hermes deploys (see ``JOURNAL_MODES``); every
+role is a separate OS process running ``_roles.py`` against it (see that module for the journal/report
+protocol). This module owns:
+
+* journal-mode selection through the PRODUCTION decision path: the ``delete`` arm pins the version the
+  children's ``hermes_state_wal.is_sqlite_wal_reset_vulnerable()`` probe sees to a WAL-reset-vulnerable
+  SQLite (the one CI's uv CPython 3.11.14 bundles), so ``apply_wal_with_fallback`` itself picks DELETE
+  exactly as it does for every user on such a build — the same DELETE store its network/FUSE fallbacks end
+  in; nothing in the harness issues a journal-mode pragma;
 
 * process lifecycle (spawn / ready / stop / SIGTERM / SIGKILL, PIDs recorded, nothing else touched);
-* a background ``/proc/<pid>/fd`` monitor over OUR children that records any ``(deleted)`` ``-wal``/``-shm``
-  (or main-file) descriptor — the kernel-level signature of a WAL generation unlinked under a live holder;
+* a background ``/proc/<pid>/fd`` monitor over OUR children that records any ``(deleted)`` main-file descriptor
+  (a store swapped under a live holder) and, in WAL mode, any ``(deleted)`` ``-wal``/``-shm`` — the
+  kernel-level signature of a WAL generation unlinked under a live holder;
 * the invariant checks, done in the test process with short-lived bare ``sqlite3`` connections only (the
   test process never imports ``hermes_state``, so it never becomes a foreign holder of the file).
 
@@ -26,11 +34,33 @@ import time
 import zlib
 from pathlib import Path
 
+from hermes_cli.sqlite_runtime import is_sqlite_wal_reset_vulnerable
 from tests.conformance.persistence._harness import REPO_ROOT, kill9_and_reap, wait_for
 
 ROLES = Path(__file__).with_name("_roles.py")
 DEFAULT_SEED = 20260923
 SEED_ENV = "HERMES_SQLITE_TORTURE_SEED"
+
+JOURNAL_MODES = ("wal", "delete")
+# Read ONLY by _roles.py in each child: the SQLite version its production version probe reports.
+SQLITE_PIN_ENV = "HERMES_E2E_SQLITE_VERSION_PIN"
+VULNERABLE_SQLITE = "3.50.4"  # bundled by uv's CPython 3.11.14 (the unit CI job): Hermes runs DELETE there
+# DELETE mode holds an EXCLUSIVE lock for every commit's journal+db fsyncs and has no writer fairness: an unpaced
+# append loop starves every other writer and reader. Gateway/TUI writers are paced by turns in the field.
+DELETE_WRITER_PACE = 0.02
+
+
+def linked_sqlite_is_wal_capable() -> bool:
+    """The production predicate on the SQLite this interpreter (and so every child) links."""
+    return not is_sqlite_wal_reset_vulnerable(sqlite3.sqlite_version_info)
+
+
+def skip_unless_deployable(journal: str) -> None:
+    """WAL is not what Hermes runs on a vulnerable SQLite, so that arm is not deployable there; DELETE always is."""
+    if journal == "wal" and not linked_sqlite_is_wal_capable():
+        import pytest
+
+        pytest.skip(f"linked SQLite {sqlite3.sqlite_version} runs Hermes in DELETE mode; the delete arm covers it")
 
 
 def base_seed() -> int:
@@ -59,17 +89,22 @@ def child_env(home: Path, hermes_home: Path) -> dict:
 class Chamber:
     """A private HERMES_HOME + state.db plus the processes playing roles against it."""
 
-    def __init__(self, root: Path, *, journal_mode: str = "wal"):
+    def __init__(self, root: Path, *, journal: str = "wal"):
+        assert journal in JOURNAL_MODES, journal
         self.root = root
+        self.mode = journal
         self.home = root / "home"
         self.hermes_home = self.home / ".hermes"
         self.hermes_home.mkdir(parents=True, exist_ok=True)
-        (self.hermes_home / "config.yaml").write_text(
-            f"database:\n  journal_mode: {journal_mode}\n", encoding="utf-8")
+        # The config default in BOTH arms: the delete arm is a default-config user on a vulnerable SQLite.
+        (self.hermes_home / "config.yaml").write_text("database:\n  journal_mode: wal\n", encoding="utf-8")
         self.db = self.hermes_home / "state.db"
         self.work = root / "work"
         self.work.mkdir(exist_ok=True)
         self.env = child_env(self.home, self.hermes_home)
+        if journal == "delete" and linked_sqlite_is_wal_capable():
+            self.env[SQLITE_PIN_ENV] = VULNERABLE_SQLITE
+        self.writer_pace = DELETE_WRITER_PACE if journal == "delete" else 0.0
         self.procs: dict[str, subprocess.Popen] = {}
         self.writer_runs: list[str] = []
         self.reader_seq = 0
@@ -84,8 +119,10 @@ class Chamber:
     # -- lifecycle ---------------------------------------------------------------------------------
     def spawn(self, role: str, name: str, *, env: dict | None = None, **args) -> subprocess.Popen:
         assert name not in self.procs, f"duplicate role name {name}"
+        if role == "writer":
+            args.setdefault("pace", self.writer_pace)
         payload = {"workdir": str(self.work), "name": name, "db": str(self.db),
-                   "stop": str(self.work / f"{name}.stop"), **args}
+                   "stop": str(self.work / f"{name}.stop"), "busy_ok": self.mode == "delete", **args}
         stderr = open(self.work / f"{name}.stderr", "wb")  # noqa: SIM115 - closed in reap()
         proc = subprocess.Popen(
             [sys.executable, str(ROLES), role, json.dumps(payload)],
@@ -100,10 +137,12 @@ class Chamber:
         return proc
 
     def spawn_cli(self, name: str, *argv: str) -> subprocess.Popen:
-        """A real `hermes …` CLI subprocess against this HERMES_HOME."""
+        """A real `hermes …` CLI subprocess against this HERMES_HOME (``hermes_cli.main`` run as ``__main__``
+        by ``_roles.py cli`` so the journal-mode seam applies to it too)."""
         stderr = open(self.work / f"{name}.stderr", "wb")  # noqa: SIM115 - closed in reap()
+        payload = {"workdir": str(self.work), "name": name, "argv": list(argv)}
         proc = subprocess.Popen(
-            [sys.executable, "-m", "hermes_cli.main", *argv], cwd=str(REPO_ROOT), env=self.env,
+            [sys.executable, str(ROLES), "cli", json.dumps(payload)], cwd=str(REPO_ROOT), env=self.env,
             stdin=subprocess.DEVNULL, stdout=open(self.work / f"{name}.stdout", "wb"), stderr=stderr,  # noqa: SIM115
         )
         proc._stderr_file = stderr  # type: ignore[attr-defined]
@@ -183,7 +222,9 @@ class Chamber:
 
     # -- kernel truth: (deleted) sidecars held by our children --------------------------------------
     def _scan_loop(self) -> None:
-        targets = {str(self.db), f"{self.db}-wal", f"{self.db}-shm"}
+        targets = {str(self.db)}
+        if self.mode == "wal":
+            targets |= {f"{self.db}-wal", f"{self.db}-shm"}
         while not self._monitor_stop.is_set():
             for name, proc in self.live():
                 fd_dir = f"/proc/{proc.pid}/fd"
@@ -324,6 +365,34 @@ def fts_problems(db: Path, sample_tokens: list[str]) -> list[str]:
     finally:
         conn.close()
     return problems
+
+
+def journal_mode_problems(chamber: Chamber, prefix: str = "") -> list[str]:
+    """The store is still in the arm's journal mode, and every production SessionDB role (whose ``ready``
+    event reports ``SessionDB._wal_active``) really ran in it — the seam took, the arm is not vacuous."""
+    problems = []
+    mode = journal_mode(chamber.db)
+    if mode != chamber.mode:
+        problems.append(f"journal_mode is {mode!r} after the episode (arm is {chamber.mode})")
+    want = chamber.mode == "wal"
+    for name in list(chamber.procs):
+        if not name.startswith(prefix):
+            continue
+        ready = [e for e in chamber.events(name) if e.get("event") == "ready" and "wal" in e]
+        if ready and ready[0]["wal"] != want:
+            problems.append(f"{name} opened SessionDB with _wal_active={ready[0]['wal']} in the {chamber.mode} arm")
+    return problems
+
+
+def busy_summary(chamber: Chamber, prefix: str = "") -> dict[str, int]:
+    """DELETE arm only: SQLITE_BUSY refusals the roles waited out, per operation (availability, not integrity)."""
+    out: dict[str, int] = {}
+    for name in list(chamber.procs):
+        if name.startswith(prefix):
+            for e in chamber.events(name):
+                if e.get("event") == "busy":
+                    out[e["op"]] = out.get(e["op"], 0) + 1
+    return out
 
 
 def exactly_once_problems(chamber: Chamber) -> list[str]:

@@ -1,6 +1,9 @@
 """SQLite torture chamber: state.db integrity under real multi-process load (issue class C1).
 
-One WAL ``state.db``; every role is its own OS process running the production ``SessionDB``:
+One ``state.db`` per journal mode Hermes deploys — WAL, and DELETE (what it runs on a WAL-reset-vulnerable
+SQLite and on network/FUSE homes; selected by the production ``apply_wal_with_fallback`` through a pinned
+version probe in every child, see ``_helpers``); every role is its own OS process running the production
+``SessionDB``:
 a gateway-like writer, a TUI-like writer, a dashboard-like reader that opens at startup and lives across
 episodes, short-lived openers (production ``SessionDB`` and bare ``sqlite3``, plus the real
 ``hermes sessions list`` / ``sessions stats`` CLI), FTS rebuild/optimize maintenance, and
@@ -9,14 +12,18 @@ close, POSIX lock cancellation by a stray in-process open/close, chmod flips, co
 repair against a live and an offline store, FTS corruption, a whole-fleet SIGKILL — and then asserts the
 SAME invariants:
 
-* ``PRAGMA integrity_check`` is ``ok`` and the store is still in WAL mode;
-* no child ever held a ``(deleted)`` ``state.db``/``-wal``/``-shm`` descriptor (``/proc/<pid>/fd`` scan);
+* ``PRAGMA integrity_check`` is ``ok``; the store is still in the arm's journal mode and every SessionDB
+  role really ran in it;
+* no child ever held a ``(deleted)`` ``state.db`` descriptor — nor, in WAL mode, ``-wal``/``-shm``
+  (``/proc/<pid>/fd`` scan);
 * every acknowledged append is stored exactly once (per-writer intent/ack journals), an in-flight append at
   most once, and no row exists that no writer intended;
 * canonical row counts only grow (no compaction runs here), and repair never lowers them;
 * FTS mirrors the canonical rows (docsize == source rows, FTS5 ``integrity-check``) and session search
   finds acked messages exactly once;
-* no role hit an error; the long-lived reader's and the open/close churner's fd counts stay bounded.
+* no role hit an error (DELETE arm: readers block on writes by design, so a SQLITE_BUSY refusal of a read,
+  open or FTS pass is waited out and counted, never an integrity failure); the long-lived reader's and the
+  open/close churner's fd counts stay bounded.
 
 Randomness (ack thresholds, kill points) is seeded per episode; the seed is in every failure message and
 ``HERMES_SQLITE_TORTURE_SEED`` replays a run.
@@ -34,17 +41,20 @@ import pytest
 
 from tests.conformance.persistence._harness import wait_for
 from tests.e2e.core.sqlite._helpers import (
+    JOURNAL_MODES,
     SEED_ENV,
     Chamber,
     acked_tokens,
     base_seed,
+    busy_summary,
     counts,
     episode_seed,
     exactly_once_problems,
     fts_problems,
     integrity_rows,
-    journal_mode,
+    journal_mode_problems,
     sample,
+    skip_unless_deployable,
 )
 
 pytestmark = [
@@ -55,18 +65,10 @@ READER_FD_SLACK = 6
 CHURN_FD_SLACK = 2
 
 
-def _sqlite_wal_capable() -> bool:
-    # Mirror of the requires_wal gate: SQLite 3.7.0-3.51.2 (minus backports) has the WAL-reset bug, and
-    # Hermes deliberately falls back to DELETE there, so a WAL chamber is not deployable on that runtime.
-    v = sqlite3.sqlite_version_info
-    return v >= (3, 51, 3) or v in ((3, 50, 7), (3, 44, 6))
-
-
-@pytest.fixture(scope="module")
-def chamber(tmp_path_factory):
-    if not _sqlite_wal_capable():
-        pytest.skip(f"linked SQLite {sqlite3.sqlite_version} runs Hermes in DELETE mode; chamber needs WAL")
-    ch = Chamber(tmp_path_factory.mktemp("chamber"))
+@pytest.fixture(scope="module", params=JOURNAL_MODES)
+def chamber(request, tmp_path_factory):
+    skip_unless_deployable(request.param)
+    ch = Chamber(tmp_path_factory.mktemp(f"chamber-{request.param}"), journal=request.param)
     _ensure_reader(ch)
     yield ch
     ch.shutdown()
@@ -112,7 +114,7 @@ def _reap_all(ch: Chamber, names: list[str]) -> None:
         proc = ch.procs[name]
         if proc.returncode is None:
             rc = ch.reap(name)
-            errors = [e.get("error") for e in ch.events(name) if e.get("event") == "error"]
+            errors = [f"{e.get('error')}\n{e.get('tb', '')}" for e in ch.events(name) if e.get("event") == "error"]
             assert rc == 0, f"{name} exited {rc}: {errors}\n{ch.stderr(name)}"
 
 
@@ -200,7 +202,7 @@ def ep_chmod_flip(ch, ep, rng):
     gw, tui = _writers(ch, ep)
     files = [ch.db, ch.db.with_name(ch.db.name + "-wal"), ch.db.with_name(ch.db.name + "-shm")]
     try:
-        for i in range(rng.randint(6, 10)):
+        for i in range(rng.randint(3, 5)):  # each flip is the same fault; process start-up dominates
             for f in files:
                 if f.exists():
                     os.chmod(f, 0o644)  # a permissive mode the next SessionDB open tightens
@@ -338,7 +340,8 @@ def _churn_fd_problems(ch: Chamber, ep: str) -> list[str]:
 def test_torture_episode(chamber, episode):
     seed = episode_seed(episode)
     rng = random.Random(seed)
-    ctx = f"[episode={episode} seed={seed} base={base_seed()}; replay: {SEED_ENV}={base_seed()}]"
+    ctx = (f"[journal={chamber.mode} episode={episode} seed={seed} base={base_seed()}; "
+           f"replay: {SEED_ENV}={base_seed()}]")
     _ensure_reader(chamber)
     before = counts(chamber.db) if chamber.db.exists() else {"__total__": 0}
     started = time.monotonic()
@@ -354,9 +357,7 @@ def test_torture_episode(chamber, episode):
     rows = integrity_rows(chamber.db)
     if rows != ["ok"]:
         problems.append(f"integrity_check: {rows[:5]}")
-    mode = journal_mode(chamber.db)
-    if mode != "wal":
-        problems.append(f"journal_mode is {mode!r} after the episode (was wal)")
+    problems += journal_mode_problems(chamber)
     problems += exactly_once_problems(chamber)
     after = counts(chamber.db)
     for sid, n in before.items():
@@ -368,7 +369,8 @@ def test_torture_episode(chamber, episode):
     problems += fts_problems(chamber.db, sample(rng, episode_acks, 12))
     problems += _reader_fd_problems(chamber)
     problems += _churn_fd_problems(chamber, episode)
-    assert not problems, f"{ctx} ({time.monotonic() - started:.1f}s)\n" + "\n".join(problems)
+    busy = busy_summary(chamber, episode)
+    assert not problems, f"{ctx} ({time.monotonic() - started:.1f}s, busy waits {busy})\n" + "\n".join(problems)
 
 
 def test_long_lived_reader_saw_every_episode_grow_only(chamber):

@@ -2,7 +2,9 @@
 compaction").
 
 Real ``AIAgent`` processes drive real turns (user -> terminal tool call -> answer) through the loopback fake
-provider on ONE shared WAL ``state.db``, while other processes write to, read and open/close the same file:
+provider on ONE shared ``state.db`` — once per journal mode Hermes deploys (WAL, and the DELETE mode the
+production ``apply_wal_with_fallback`` picks on a WAL-reset-vulnerable SQLite, see ``_helpers``) — while other
+processes write to, read and open/close the same file:
 
 * a gateway-like agent with rolling micro-compaction on (every turn folds the oldest exchange into a summary
   and commits it through ``archive_and_compact``);
@@ -18,7 +20,8 @@ turns. Invariants after every episode:
   as compacted history (``compacted=1``) — and never live twice;
 * the exchanges ``/compress here N`` promised to keep are live exactly once;
 * canonical row counts only grow (compaction archives, it never deletes) — sampled continuously from outside
-  and by the reader; ``integrity_check`` ok; FTS mirrors canonical rows; no ``(deleted)`` WAL held;
+  and by the reader; ``integrity_check`` ok; FTS mirrors canonical rows; the store stays in the arm's journal
+  mode; no ``(deleted)`` store (nor, in WAL mode, ``-wal``/``-shm``) held;
 * the resumed process sends the model every acknowledged user turn exactly once (persisted == sent);
 * the plain writer's acked appends are stored exactly once.
 """
@@ -37,15 +40,19 @@ from dataclasses import dataclass
 import pytest
 
 from tests.e2e.core.sqlite._helpers import (
+    JOURNAL_MODES,
     SEED_ENV,
     Chamber,
     base_seed,
+    busy_summary,
     compress_journal,
     counts,
     episode_seed,
     exactly_once_problems,
     fts_problems,
     integrity_rows,
+    journal_mode_problems,
+    skip_unless_deployable,
     token_flags,
 )
 from tests.fakes.fake_llm_provider import FakeLLMServer, Text, ToolCall, write_hermes_home
@@ -110,15 +117,13 @@ class Rig:
     tui_env: dict
 
 
-@pytest.fixture(scope="module")
-def rig(tmp_path_factory):
-    v = sqlite3.sqlite_version_info
-    if not (v >= (3, 51, 3) or v in ((3, 50, 7), (3, 44, 6))):
-        pytest.skip(f"linked SQLite {sqlite3.sqlite_version} runs Hermes in DELETE mode")
+@pytest.fixture(scope="module", params=JOURNAL_MODES)
+def rig(request, tmp_path_factory):
+    skip_unless_deployable(request.param)
     aux = _Aux()
     server = FakeLLMServer(_responder, aux=aux)
     server.start()
-    ch = Chamber(tmp_path_factory.mktemp("compaction"))
+    ch = Chamber(tmp_path_factory.mktemp(f"compaction-{request.param}"), journal=request.param)
     ctx = "  context_length: 128000\n"
     write_hermes_home(ch.hermes_home, server.base_url, extra_config=MICRO_CONFIG + DB_CONFIG)
     tui_home = ch.root / "tui-home"
@@ -216,7 +221,7 @@ def _compacted_rows(ch: Chamber, sid: str) -> int:
 
 def _reap_ok(ch: Chamber, name: str, deadline: float = 120.0) -> None:
     rc = ch.reap(name, deadline=deadline)
-    errors = [e.get("error") for e in ch.events(name) if e.get("event") == "error"]
+    errors = [f"{e.get('error')}\n{e.get('tb', '')}" for e in ch.events(name) if e.get("event") == "error"]
     assert rc == 0, f"{name} exited {rc}: {errors}\n{ch.stderr(name)}"
 
 
@@ -225,7 +230,7 @@ def test_compaction_episode(rig, fault):
     ch = rig.ch
     seed = episode_seed(f"compaction:{fault}")
     rng = random.Random(seed)
-    ctx = f"[fault={fault} seed={seed} base={base_seed()}; replay: {SEED_ENV}={base_seed()}]"
+    ctx = f"[journal={ch.mode} fault={fault} seed={seed} base={base_seed()}; replay: {SEED_ENV}={base_seed()}]"
     gw_sid, tui_sid = f"{fault}-gw", f"{fault}-tui"
     gw, tui, plain, reader = f"{fault}-agent-gw", f"{fault}-agent-tui", f"{fault}-plain", f"{fault}-reader"
     sampler = _GrowOnly(ch)
@@ -273,6 +278,7 @@ def test_compaction_episode(rig, fault):
     rows = integrity_rows(ch.db)
     if rows != ["ok"]:
         problems.append(f"integrity_check: {rows[:5]}")
+    problems += journal_mode_problems(ch, prefix=fault)
     problems += sampler.violations
     problems += _turn_problems(ch, gw, compacting=True)
     problems += _turn_problems(ch, resumed, compacting=True)
@@ -285,4 +291,5 @@ def test_compaction_episode(rig, fault):
     for sid in (gw_sid, tui_sid):  # vacuity guard: a compaction commit really landed in this episode
         if not _compacted_rows(ch, sid):
             problems.append(f"no compacted history rows in {sid}: compaction never committed")
-    assert not problems, f"{ctx} ({sampler.samples} row-count samples)\n" + "\n".join(problems)
+    busy = busy_summary(ch, fault)
+    assert not problems, f"{ctx} ({sampler.samples} row-count samples, busy waits {busy})\n" + "\n".join(problems)

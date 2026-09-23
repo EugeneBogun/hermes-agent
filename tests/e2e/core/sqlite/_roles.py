@@ -9,6 +9,10 @@ connection) and reports through append-only files, so a ``kill -9`` loses nothin
 
 Tokens are single FTS words (``TK`` + alnum) so the test can look every acknowledged append up by content,
 through ``messages`` and through the FTS indexes.
+
+Journal-mode seam: with ``HERMES_E2E_SQLITE_VERSION_PIN`` set, the production version probe
+``hermes_state_wal.is_sqlite_wal_reset_vulnerable()`` reports that SQLite version instead of the linked one;
+the real range predicate and ``apply_wal_with_fallback`` then decide the journal mode as they would there.
 """
 
 from __future__ import annotations
@@ -50,6 +54,37 @@ class Out:
         event.setdefault("pid", os.getpid())
         event.setdefault("t", time.time())
         os.write(self.report_fd, (json.dumps(event) + "\n").encode())
+
+
+def _apply_sqlite_version_pin() -> None:
+    pin = os.environ.get("HERMES_E2E_SQLITE_VERSION_PIN")
+    if not pin:
+        return
+    import hermes_state_wal
+
+    pinned = tuple(int(p) for p in pin.split("."))
+    probe = hermes_state_wal.is_sqlite_wal_reset_vulnerable
+
+    def is_sqlite_wal_reset_vulnerable(version_info=None):
+        return probe(pinned if version_info is None else version_info)
+
+    hermes_state_wal.is_sqlite_wal_reset_vulnerable = is_sqlite_wal_reset_vulnerable
+
+
+def _patient(a: dict, out: Out, op: str, fn, *, deadline: float = 90.0):
+    """Run ``fn()``; in the DELETE arm (``busy_ok``) a SQLITE_BUSY refusal is reported as a ``busy`` event and
+    retried. DELETE mode is documented to block readers on writes (hermes_state_wal), so a busy read/open is an
+    availability event there, never an integrity one. In the WAL arm it propagates and fails the role."""
+    end = time.monotonic() + deadline
+    while True:
+        try:
+            return fn()
+        except sqlite3.OperationalError as exc:
+            busy = any(m in str(exc).lower() for m in ("database is locked", "database is busy"))
+            if not (busy and a.get("busy_ok")) or time.monotonic() > end:
+                raise
+            out.report(event="busy", op=op, error=repr(exc))
+            time.sleep(0.05)
 
 
 def _fd_count() -> int:
@@ -127,18 +162,22 @@ def role_reader(a: dict, out: Out) -> int:
     from hermes_state import SessionDB
 
     db_path, stop_file = Path(a["db"]), Path(a["stop"])
-    db = SessionDB(db_path=db_path)
-    out.report(event="ready", fds=_fd_count())
+    db = _patient(a, out, "open", lambda: SessionDB(db_path=db_path))
+    out.report(event="ready", wal=bool(getattr(db, "_wal_active", False)), fds=_fd_count())
     seen: dict[str, int] = {}
     passes = 0
+
+    def _pass() -> None:
+        for row in db.list_sessions_rich(limit=200):
+            sid = row["id"]
+            n = db.message_count(sid)
+            if n < seen.get(sid, 0):
+                out.report(event="error", error=f"count went down for {sid}: {seen[sid]} -> {n}")
+            seen[sid] = max(n, seen.get(sid, 0))
+
     try:
         while not _stopping(stop_file):
-            for row in db.list_sessions_rich(limit=200):
-                sid = row["id"]
-                n = db.message_count(sid)
-                if n < seen.get(sid, 0):
-                    out.report(event="error", error=f"count went down for {sid}: {seen[sid]} -> {n}")
-                seen[sid] = max(n, seen.get(sid, 0))
+            _patient(a, out, "read", _pass)
             passes += 1
             if passes % 5 == 0:
                 out.report(event="stats", passes=passes, fds=_fd_count(), total=sum(seen.values()))
@@ -161,16 +200,24 @@ def role_churn(a: dict, out: Out) -> int:
     db_path = Path(a["db"])
     start_fds = _fd_count()
     fds_after_warmup = None
+
+    def _hermes_cycle() -> None:
+        db = SessionDB(db_path=db_path)
+        try:
+            db.message_count()
+        finally:
+            db.close()
+
+    def _raw_cycle() -> None:
+        conn = sqlite3.connect(str(db_path), timeout=30.0)
+        try:
+            conn.execute("SELECT count(*) FROM messages").fetchone()
+        finally:
+            conn.close()
+
     try:
         for i in range(int(a["iterations"])):
-            if i % 2 == 0:
-                db = SessionDB(db_path=db_path)
-                db.message_count()
-                db.close()
-            else:
-                conn = sqlite3.connect(str(db_path), timeout=30.0)
-                conn.execute("SELECT count(*) FROM messages").fetchone()
-                conn.close()
+            _patient(a, out, "churn", _raw_cycle if i % 2 else _hermes_cycle)
             if i == 3:
                 fds_after_warmup = _fd_count()
     except BaseException as exc:
@@ -184,16 +231,23 @@ def role_churn(a: dict, out: Out) -> int:
 def role_opener(a: dict, out: Out) -> int:
     """One short-lived process: open, count, close, exit (the last-close checkpoint path)."""
     db_path = Path(a["db"])
-    try:
+
+    def _open_count_close() -> int:
         if a.get("raw"):
             conn = sqlite3.connect(str(db_path), timeout=30.0)
-            n = conn.execute("SELECT count(*) FROM messages").fetchone()[0]
-            conn.close()
-        else:
-            from hermes_state import SessionDB
-            db = SessionDB(db_path=db_path)
-            n = db.message_count()
+            try:
+                return conn.execute("SELECT count(*) FROM messages").fetchone()[0]
+            finally:
+                conn.close()
+        from hermes_state import SessionDB
+        db = SessionDB(db_path=db_path)
+        try:
+            return db.message_count()
+        finally:
             db.close()
+
+    try:
+        n = _patient(a, out, "open", _open_count_close)
     except BaseException as exc:
         # may_fail: the chmod episode opens a read-only file; a clean refusal is correct, damage is not.
         if a.get("may_fail"):
@@ -217,11 +271,11 @@ def role_fts(a: dict, out: Out) -> int:
     """Maintenance pass: full FTS rebuild + optimize through SessionDB (cross-process admission)."""
     from hermes_state import SessionDB
 
-    db = SessionDB(db_path=Path(a["db"]))
+    db = _patient(a, out, "open", lambda: SessionDB(db_path=Path(a["db"])))
     out.report(event="ready")
     try:
-        rebuilt = db.rebuild_fts()
-        optimized = db.optimize_fts()
+        rebuilt = _patient(a, out, "fts", db.rebuild_fts)
+        optimized = _patient(a, out, "fts", db.optimize_fts)
     except BaseException as exc:
         out.report(event="error", error=repr(exc), tb=traceback.format_exc()[-3000:])
         return 2
@@ -265,7 +319,7 @@ def role_agent(a: dict, out: Out) -> int:
                     session_db=db, session_id=a["session_id"], skip_context_files=True, skip_memory=True)
     history = db.get_messages_as_conversation(a["session_id"]) if a.get("resume") else None
     out.report(event="ready", micro=bool(getattr(agent.context_compressor, "_micro_compact_enabled", False)),
-               resumed=len(history or []))
+               resumed=len(history or []), wal=bool(getattr(db, "_wal_active", False)))
     bases: list[str] = []
     try:
         for i in range(int(a["turns"])):
@@ -297,8 +351,20 @@ def role_agent(a: dict, out: Out) -> int:
     return 0
 
 
+def role_cli(a: dict, out: Out) -> int:
+    """``hermes <argv>``: ``hermes_cli.main`` run as ``__main__``, i.e. ``python -m hermes_cli.main <argv>``."""
+    import runpy
+
+    sys.argv = ["hermes", *a["argv"]]
+    try:
+        runpy.run_module("hermes_cli.main", run_name="__main__", alter_sys=True)
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+    return 0
+
+
 ROLES = {
-    "agent": role_agent,
+    "agent": role_agent, "cli": role_cli,
     "writer": role_writer, "reader": role_reader, "churn": role_churn, "opener": role_opener,
     "fts": role_fts, "repair": role_repair,
 }
@@ -306,7 +372,9 @@ ROLES = {
 
 def main() -> int:
     role, args = sys.argv[1], json.loads(sys.argv[2])
-    signal.signal(signal.SIGTERM, _on_sigterm)
+    _apply_sqlite_version_pin()
+    if role != "cli":  # the CLI keeps its own SIGTERM handling
+        signal.signal(signal.SIGTERM, _on_sigterm)
     out = Out(Path(args["workdir"]), args["name"])
     return ROLES[role](args, out)
 
