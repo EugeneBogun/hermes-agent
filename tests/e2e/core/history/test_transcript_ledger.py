@@ -202,9 +202,7 @@ def test_transcript_ledger(world, name):
     assert not [(a, b) for a in typed for b in typed if a != b and a in b], "scenario inputs must be unique"
     session = InProcessSession(srv.base_url, hermes_home, f"ledger-{name}")
     script.session = session
-    # Micro-compaction's merged-user-row display duplication is tracked separately (strict xfail
-    # below) so the scenario still guards every other invariant.
-    ledger = Ledger(srv, hermes_home, check_inputs=name != "micro_compaction")
+    ledger = Ledger(srv, hermes_home)
     try:
         for i, (kind, arg) in enumerate(scenario(name, script)):
             label = f"{i}:{kind}:{str(arg)[:24]}"
@@ -283,11 +281,6 @@ def test_transcript_ledger(world, name):
     assert_usage_matches(hermes_home, lineage(hermes_home, sid), srv.requests, f"scenario {name} after resume")
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "PRODUCTION BUG (opt-in micro-compaction): when a newer micro marker supersedes the old one, "
-    "_merge_adjacent_user_turns persists a merged 'A\\n\\nB' user row while the originals stay "
-    "compacted=1, so the resumed display history shows both user inputs twice. Flip to a plain test "
-    "once the display projection (or the merge) stops duplicating them."))
 def test_micro_compaction_resumed_display_shows_each_input_once(world):
     srv, script, hermes_home = world["srv"], world["script"], world["hermes_home"]
     write_hermes_home(hermes_home, srv.base_url,

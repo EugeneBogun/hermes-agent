@@ -115,6 +115,18 @@ def views(hermes_home: Path, sid: str) -> tuple[list[dict], list[dict]]:
         db.close()
 
 
+def model_only_identities(hermes_home: Path, model: list[dict]) -> set[tuple]:
+    """Identities of model-view rows stored as model-only (never part of the display projection)."""
+    ids = [m["_row_id"] for m in model if m.get("_row_id") is not None]
+    if not ids:
+        return set()
+    with db_connect(hermes_home) as con:
+        hidden = {r[0] for r in con.execute(
+            f"SELECT id FROM messages WHERE id IN ({','.join('?' * len(ids))}) "
+            "AND COALESCE(json_extract(display_metadata, '$.model_only'), 0) != 0", ids)}
+    return {identity(m) for m in model if m.get("_row_id") in hidden}
+
+
 def row_counts(hermes_home: Path, sid: str) -> dict[str, int]:
     with db_connect(hermes_home) as con:
         total, active = con.execute(
@@ -616,6 +628,7 @@ class Ledger:
         self.srv, self.home, self.check_inputs = srv, hermes_home, check_inputs
         self.ever: dict[tuple, str] = {}
         self.inputs: list[str] = []
+        self.model_only: set[tuple] = set()
         self.model_view: list[dict] | None = None
         self.counts: dict[str, int] | None = None
         self.compaction_request_idx: list[int] = []
@@ -656,7 +669,13 @@ class Ledger:
                 self.ever.setdefault(identity(m), short(identity(m)))
         assert_exactly_once(model, f"{where} (model view)")
         assert_rows_exactly_once(self.home, sid, where)
-        assert_no_loss(self.ever, display, model, where)
+        # A model-only row (micro-compaction's merged user turn) stands in for rows that ARE displayed,
+        # so it is exempt from the display no-loss check; its originals were each sent (and tracked) earlier.
+        self.model_only |= model_only_identities(self.home, model)
+        merged = self.model_only
+        for k in merged:
+            self.ever.pop(k, None)
+        assert_no_loss(self.ever, display, [m for m in model if identity(m) not in merged], where)
         if self.check_inputs:
             assert_inputs_shown_once(self.inputs, display, model, where)
         counts = row_counts(self.home, sid)
