@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional
 from agent.azure_identity_adapter import is_token_provider
 from agent.secret_scope import get_secret_str
 from hermes_constants import OPENROUTER_BASE_URL
-from utils import base_url_host_matches
+from utils import base_url_host_matches, base_url_hostname
 
 
 def _rp():
@@ -156,7 +156,12 @@ def _resolve_openrouter_runtime(
         )
     )
     if is_openrouter_context:
-        candidates = [explicit_api_key, get_secret_str("OPENROUTER_API_KEY"), get_secret_str("OPENAI_API_KEY")]
+        # OPENAI_API_KEY is a legacy home for an OpenRouter key -- unless OPENAI_BASE_URL binds it
+        # to another host, where sending it to OpenRouter leaks that host's credential.
+        openai_base_host = base_url_hostname(get_secret_str("OPENAI_BASE_URL", "").strip())
+        openai_key_ok = not openai_base_host or openai_base_host == base_url_hostname(base_url)
+        candidates = [explicit_api_key, get_secret_str("OPENROUTER_API_KEY"),
+                      get_secret_str("OPENAI_API_KEY") if openai_key_ok else ""]
     else:
         # ``model.api_key`` and ``model.key_env`` back a trusted config base_url only; the key_env
         # rung is what a bare ``provider: custom`` block relies on (#67453).
