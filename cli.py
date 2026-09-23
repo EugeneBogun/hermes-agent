@@ -109,6 +109,7 @@ from hermes_cli.cli_render import (  # noqa: F401,E402
     _luminance_from_hex,
     _maybe_remap_for_light_mode,
     _output_history_recording,
+    _output_tail_fitting,
     _panel_box_width,
     _post_stream_transform_output,
     _prepend_note_to_message,
@@ -646,22 +647,11 @@ def _suspend_output_history():
         _OUTPUT_HISTORY_SUPPRESSED = old_value
 
 
-def _visible_terminal_rows() -> int:
-    """Return the terminal's current visible row count (fallback 24)."""
-    try:
-        return shutil.get_terminal_size((80, 24)).lines
-    except Exception:
-        return 24
-
-
-def _replay_output_history() -> None:
+def _replay_output_history(fit=None) -> None:
     """Repaint recent output above the prompt after a full screen clear.
 
-    The pre-replay clear only wipes the *visible* viewport (CSI 2J), not the
-    scrollback, so re-printing the full ``_OUTPUT_HISTORY`` buffer on every
-    resize/redraw would append a duplicate copy of the history to scrollback
-    (#95375). Bound the replay to the visible terminal height so a redraw
-    restores the visible transcript without stacking duplicate blocks.
+    ``fit=(rows, columns)`` replays only the newest lines whose wrapped height fits
+    ``rows`` — the older ones are still in scrollback (#95375).
     """
     global _OUTPUT_HISTORY_REPLAYING
     if not _OUTPUT_HISTORY_ENABLED or not _OUTPUT_HISTORY:
@@ -679,15 +669,9 @@ def _replay_output_history() -> None:
                 if isinstance(lines, str):
                     lines = lines.splitlines()
             rendered_lines.extend(str(line) for line in lines)
+        if fit is not None:
+            rendered_lines = _output_tail_fitting(rendered_lines, *fit)
         if rendered_lines:
-            # Only re-print what fits on the visible screen. The clear that
-            # precedes this replay wipes the viewport (CSI 2J) but not the
-            # scrollback, so re-printing the whole buffer would append a
-            # duplicate block to scrollback on every resize/redraw. Bounding
-            # the replay to the visible row count keeps the transcript intact
-            # without stacking duplicates.
-            visible_rows = max(1, _visible_terminal_rows())
-            rendered_lines = rendered_lines[-visible_rows:]
             # One payload: per-line pt prints each force a sync redraw (a waterfall of old output).
             _pt_print(_PT_ANSI("\n".join(rendered_lines)))
     except Exception:

@@ -24,6 +24,16 @@ def bare_cli():
     return cli
 
 
+def _fake_app(*, rows, columns, chrome):
+    """MagicMock app whose output reports a real size and whose layout is ``chrome`` rows tall."""
+    from prompt_toolkit.data_structures import Size
+
+    app = MagicMock()
+    app.renderer.output.get_size.return_value = Size(rows=rows, columns=columns)
+    app.layout.container.preferred_height.return_value.preferred = chrome
+    return app
+
+
 class TestForceFullRedraw:
     def test_no_app_is_safe(self, bare_cli):
         # _force_full_redraw must be a no-op when the TUI isn't running.
@@ -34,17 +44,17 @@ class TestForceFullRedraw:
 
 
     def test_resize_recovery_clears_viewport_on_width_change(self, bare_cli, monkeypatch):
-        """A WIDTH change must wipe the visible viewport (CSI 2J) and replay.
+        """A WIDTH change must wipe the visible viewport and replay.
 
         On column shrink the terminal reflows the old full-width chrome into
         extra rows that prompt_toolkit's stale-cursor erase cannot reach,
         leaving a duplicated status bar (#19280/#5474 class). We route through
-        the same recovery as Ctrl+L: erase_screen (2J) + replay transcript.
+        the same recovery as Ctrl+L: erase the viewport + replay transcript.
         It must be banner-safe — CSI 3J (write_raw) must NOT fire.
         """
-        app = MagicMock()
+        app = _fake_app(rows=30, columns=90, chrome=5)
         events = []
-        app.renderer.output.erase_screen.side_effect = lambda: events.append("erase")
+        app.renderer.output.erase_end_of_line.side_effect = lambda: events.append("erase")
         app.renderer.output.write_raw.side_effect = lambda *_: events.append("scrollback_wipe")
         original_on_resize = lambda: events.append("original_resize")
 
@@ -52,7 +62,7 @@ class TestForceFullRedraw:
         bare_cli._last_resize_width = 200
         monkeypatch.setattr(bare_cli, "_get_tui_terminal_width", lambda: 90)
         monkeypatch.setattr(bare_cli, "_schedule_status_bar_unsuppress", lambda *_: None)
-        monkeypatch.setattr(cli_mod, "_replay_output_history", lambda: events.append("replay"))
+        monkeypatch.setattr(cli_mod, "_replay_output_history", lambda *_: events.append("replay"))
         monkeypatch.setattr(
             cli_mod,
             "CLI_CONFIG",
@@ -71,9 +81,14 @@ class TestForceFullRedraw:
         assert bare_cli._last_resize_width == 90
         assert bare_cli._status_bar_suppressed_after_resize is True
 
-    def test_force_redraw_uses_full_screen_clear_without_scrollback_clear(self, bare_cli, monkeypatch):
-        app = MagicMock()
+    def test_force_redraw_refills_only_the_viewport_without_a_screen_clear(self, bare_cli, monkeypatch):
+        """#95375: scrollback already holds the older transcript, so a redraw must
+        neither emit CSI 2J (scroll-on-clear terminals — tmux, VTE — copy the whole
+        screen into scrollback first) nor replay more than fits above the chrome."""
+        app = _fake_app(rows=30, columns=100, chrome=6)
         bare_cli._app = app
+        fits = []
+        monkeypatch.setattr(cli_mod, "_replay_output_history", lambda fit=None: fits.append(fit))
         monkeypatch.setattr(
             cli_mod,
             "CLI_CONFIG",
@@ -82,13 +97,17 @@ class TestForceFullRedraw:
 
         bare_cli._force_full_redraw()
 
-        app.renderer.output.erase_screen.assert_called_once()
-        app.renderer.output.cursor_goto.assert_called_once_with(0, 0)
-        app.renderer.output.write_raw.assert_not_called()
+        out = app.renderer.output
+        out.erase_screen.assert_not_called()
+        out.write_raw.assert_not_called()
+        assert out.erase_end_of_line.call_count == 30
+        assert fits == [(24, 100)]
 
     def test_force_redraw_can_clear_scrollback_when_configured(self, bare_cli, monkeypatch):
         app = MagicMock()
         bare_cli._app = app
+        fits = []
+        monkeypatch.setattr(cli_mod, "_replay_output_history", lambda fit=None: fits.append(fit))
         monkeypatch.setattr(
             cli_mod,
             "CLI_CONFIG",
@@ -99,6 +118,8 @@ class TestForceFullRedraw:
 
         app.renderer.output.erase_screen.assert_called_once()
         app.renderer.output.write_raw.assert_called_once_with("\x1b[3J")
+        # Scrollback was wiped, so the whole history is replayed to rebuild it.
+        assert fits == [None]
 
     def test_resize_recovery_can_clear_scrollback_when_configured(self, bare_cli, monkeypatch):
         app = MagicMock()
@@ -111,7 +132,7 @@ class TestForceFullRedraw:
         bare_cli._last_resize_width = 200
         monkeypatch.setattr(bare_cli, "_get_tui_terminal_width", lambda: 90)
         monkeypatch.setattr(bare_cli, "_schedule_status_bar_unsuppress", lambda *_: None)
-        monkeypatch.setattr(cli_mod, "_replay_output_history", lambda: events.append("replay"))
+        monkeypatch.setattr(cli_mod, "_replay_output_history", lambda *_: events.append("replay"))
         monkeypatch.setattr(
             cli_mod,
             "CLI_CONFIG",
@@ -139,7 +160,7 @@ class TestForceFullRedraw:
         bare_cli._last_resize_width = 120
         monkeypatch.setattr(bare_cli, "_get_tui_terminal_width", lambda: 120)
         monkeypatch.setattr(bare_cli, "_schedule_status_bar_unsuppress", lambda *_: None)
-        monkeypatch.setattr(cli_mod, "_replay_output_history", lambda: events.append("replay"))
+        monkeypatch.setattr(cli_mod, "_replay_output_history", lambda *_: events.append("replay"))
 
         bare_cli._recover_after_resize(app, original_on_resize)
 
@@ -299,7 +320,7 @@ class TestFirstSigwinchBaseline:
         monkeypatch.setattr(bare_cli, "_get_tui_terminal_width", lambda: 120)
         monkeypatch.setattr(bare_cli, "_schedule_status_bar_unsuppress", lambda *_: None)
         monkeypatch.setattr(
-            cli_mod, "_replay_output_history", lambda: events.append("replay")
+            cli_mod, "_replay_output_history", lambda *_: events.append("replay")
         )
 
         bare_cli._recover_after_resize(app, original_on_resize)
@@ -313,10 +334,10 @@ class TestFirstSigwinchBaseline:
     def test_real_width_change_after_baseline_still_replays(
         self, bare_cli, monkeypatch
     ):
-        """The #49120 recovery (2J + replay) must still fire on a real change."""
-        app = MagicMock()
+        """The #49120 recovery (viewport erase + replay) must still fire on a real change."""
+        app = _fake_app(rows=30, columns=90, chrome=5)
         events = []
-        app.renderer.output.erase_screen.side_effect = lambda: events.append("erase")
+        app.renderer.output.erase_end_of_line.side_effect = lambda: events.append("erase")
         original_on_resize = lambda: events.append("original_resize")
 
         bare_cli._status_bar_suppressed_after_resize = False
@@ -324,7 +345,7 @@ class TestFirstSigwinchBaseline:
         monkeypatch.setattr(bare_cli, "_get_tui_terminal_width", lambda: 90)
         monkeypatch.setattr(bare_cli, "_schedule_status_bar_unsuppress", lambda *_: None)
         monkeypatch.setattr(
-            cli_mod, "_replay_output_history", lambda: events.append("replay")
+            cli_mod, "_replay_output_history", lambda *_: events.append("replay")
         )
 
         bare_cli._recover_after_resize(app, original_on_resize)
@@ -391,83 +412,22 @@ class TestFirstSigwinchBaseline:
         assert getattr(bare_cli, "_last_resize_width", None) is None
 
 
-class TestReplayBoundedToVisibleHeight:
-    """Bug #95375: persistent_output replay must not append a duplicate block
-    to scrollback on resize/redraw.
+class TestReplayFitsViewport:
+    """#95375: a redraw that keeps scrollback replays only what the viewport holds."""
 
-    The pre-replay clear only wipes the visible viewport (CSI 2J), not the
-    scrollback, so re-printing the full ``_OUTPUT_HISTORY`` buffer on every
-    resize/redraw stacked a fresh copy of the history below the old content.
-    The replay must be bounded to the terminal's visible row count.
-    """
-
-    def test_replay_emits_at_most_visible_rows(self, monkeypatch):
-        """With 200 history lines and a 10-row terminal, replay emits ~10 lines,
-        not all 200."""
+    def test_replay_keeps_newest_lines_that_fit_wrapped(self, monkeypatch):
         cli_mod._configure_output_history(True, 200)
         for i in range(200):
             cli_mod._record_output_history(f"history line {i}")
-
+        cli_mod._record_output_history("x" * 150)  # soft-wraps to 2 rows at 100 cols
         printed = []
         monkeypatch.setattr(cli_mod, "_pt_print", lambda x: printed.append(x))
         monkeypatch.setattr(cli_mod, "_PT_ANSI", lambda t: t)
-        monkeypatch.setattr(
-            cli_mod.shutil,
-            "get_terminal_size",
-            lambda *a, **k: __import__("os").terminal_size((80, 10)),
-        )
 
-        cli_mod._replay_output_history()
+        cli_mod._replay_output_history((10, 100))
 
-        assert len(printed) == 1, "replay must emit a single ANSI payload"
-        replayed = printed[0].split("\n")
-        assert len(replayed) <= 10, (
-            f"replay emitted {len(replayed)} lines, expected at most 10 "
-            "(visible terminal height) — full 200-line buffer was re-printed"
-        )
-        # The LAST visible lines are replayed, not the first.
-        assert replayed == [f"history line {i}" for i in range(190, 200)]
-
-    def test_replay_keeps_full_history_buffer(self, monkeypatch):
-        """Bounding the replay must NOT truncate _OUTPUT_HISTORY itself — the
-        deque keeps the full history for other consumers."""
-        cli_mod._configure_output_history(True, 200)
-        for i in range(200):
-            cli_mod._record_output_history(f"history line {i}")
-
-        monkeypatch.setattr(cli_mod, "_pt_print", lambda x: None)
-        monkeypatch.setattr(cli_mod, "_PT_ANSI", lambda t: t)
-        monkeypatch.setattr(
-            cli_mod.shutil,
-            "get_terminal_size",
-            lambda *a, **k: __import__("os").terminal_size((80, 10)),
-        )
-
-        cli_mod._replay_output_history()
-
-        assert len(cli_mod._OUTPUT_HISTORY) == 200, (
-            "_OUTPUT_HISTORY must keep the full buffer after a bounded replay"
-        )
-
-    def test_replay_emits_all_when_history_fits(self, monkeypatch):
-        """When the history is shorter than the visible height, everything is
-        replayed (no regression for small transcripts)."""
-        cli_mod._configure_output_history(True, 200)
-        for i in range(5):
-            cli_mod._record_output_history(f"line {i}")
-
-        printed = []
-        monkeypatch.setattr(cli_mod, "_pt_print", lambda x: printed.append(x))
-        monkeypatch.setattr(cli_mod, "_PT_ANSI", lambda t: t)
-        monkeypatch.setattr(
-            cli_mod.shutil,
-            "get_terminal_size",
-            lambda *a, **k: __import__("os").terminal_size((80, 10)),
-        )
-
-        cli_mod._replay_output_history()
-
-        assert printed[0].split("\n") == [f"line {i}" for i in range(5)]
+        assert printed[0].split("\n") == [f"history line {i}" for i in range(192, 200)] + ["x" * 150]
+        assert len(cli_mod._OUTPUT_HISTORY) == 200  # the buffer itself is untouched
 
 
 class TestFocusRegainRedraw:

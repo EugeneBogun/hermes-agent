@@ -497,6 +497,20 @@ def _record_output_history(text: str) -> None:
         _cli()._OUTPUT_HISTORY.extend(str(text).replace("\r", "").rstrip("\n").splitlines())
 
 
+def _output_tail_fitting(lines: list[str], max_rows: int, columns: int) -> list[str]:
+    """Newest ``lines`` whose soft-wrapped height at ``columns`` fits in ``max_rows``."""
+    from prompt_toolkit.formatted_text import ANSI, fragment_list_width, to_formatted_text
+    kept, used = [], 0
+    for line in reversed(lines):
+        width = fragment_list_width(to_formatted_text(ANSI(line)))
+        used += max(1, -(-width // columns)) if columns > 0 else 1
+        if used > max_rows:
+            break
+        kept.append(line)
+    kept.reverse()
+    return kept
+
+
 def _pt_print_ansi(text: str) -> None:
     """``_pt_print(ANSI(text))``, falling back to ``print`` when stdout is not a real console."""
     from cli import _PT_ANSI, _pt_print

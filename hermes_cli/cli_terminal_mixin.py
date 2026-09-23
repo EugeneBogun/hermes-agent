@@ -128,10 +128,10 @@ class CLITerminalMixin:
         app = getattr(self, "_app", None)
         if not app:
             return
-        self._clear_prompt_toolkit_screen(app, rebuild_scrollback=self._redraw_rebuilds_scrollback())
+        fit = self._clear_prompt_toolkit_screen(app, rebuild_scrollback=self._redraw_rebuilds_scrollback())
         if getattr(self, "_terminal_io_broken", False):
             return
-        _replay_output_history()
+        _replay_output_history(fit)
         self._pet_queue_kitty_frame()
         self._app_invalidate(app, "force_full_redraw", swallow=True)
 
@@ -186,30 +186,48 @@ class CLITerminalMixin:
             pass
         self._force_full_redraw()
 
-    def _clear_prompt_toolkit_screen(self, app, *, rebuild_scrollback: bool = False) -> None:
-        """Clear the terminal and reset prompt_toolkit renderer state."""
+    def _clear_prompt_toolkit_screen(self, app, *, rebuild_scrollback: bool = False):
+        """Clear the terminal and reset prompt_toolkit renderer state.
+
+        Returns ``(rows, columns)`` of transcript room above the prompt chrome for the
+        replay that follows, or ``None`` when the whole history should be replayed
+        (scrollback wiped by CSI 3J, or the clear failed). Without 3J the older transcript
+        stays in scrollback, so the replay may only refill the viewport (#95375); the
+        viewport is erased row by row because CSI 2J makes scroll-on-clear terminals
+        (tmux, VTE) copy the whole screen into scrollback first, stacking a duplicate.
+        """
         if getattr(self, "_terminal_io_broken", False):
-            return
+            return None
         try:
             renderer = app.renderer
             out = renderer.output
             out.reset_attributes()
-            out.erase_screen()
+            fit = None
             if rebuild_scrollback:
+                out.erase_screen()
                 try:
                     out.write_raw("\x1b[3J")
                 except Exception:
                     pass
+            else:
+                size = out.get_size()
+                for row in range(size.rows):
+                    out.cursor_goto(row, 0)
+                    out.erase_end_of_line()
+                chrome = app.layout.container.preferred_height(size.columns, size.rows).preferred
+                fit = (max(0, size.rows - chrome), size.columns)
             out.cursor_goto(0, 0)
             out.flush()
             # Drop cached screen + cursor state so the next _redraw() starts from a
             # known (0, 0) origin and re-renders every cell instead of diffing stale.
             renderer.reset(leave_alternate_screen=False)
+            return fit
         except OSError as exc:
             if _is_eio(exc):
                 self._mark_terminal_io_broken("clear_screen")
         except Exception:
             pass
+        return None
 
     def _recover_after_resize(self, app, original_on_resize) -> None:
         """Recover a resized classic CLI without desynchronizing cursor state.
@@ -221,7 +239,7 @@ class CLITerminalMixin:
         already-painted rows into scrollback first, so a fresh bar looks duplicated
         (#19280, #22976). Suppression cannot erase the already-reflowed OLD bar
         (``renderer.erase()`` uses ``_cursor_pos.y`` cached at the OLD width), so on an
-        OBSERVED width change we wipe the viewport (CSI 2J, banner-safe; 3J only via
+        OBSERVED width change we wipe the viewport (banner-safe; 3J only via
         ``display.cli_rebuild_scrollback_on_redraw``) and replay the transcript first.
         Same-width SIGWINCH (tmux attach, GNOME tab bar, focus) and the first signal
         without a seeded baseline are left alone — 2J+replay against preserved scrollback
@@ -234,7 +252,6 @@ class CLITerminalMixin:
         if getattr(getattr(self, '_subagent_monitor', None), 'opening', False):
             return
         from cli import _replay_output_history
-        self._status_bar_suppressed_after_resize = True
         try:
             new_width = self._get_tui_terminal_width()
         except Exception:
@@ -242,12 +259,16 @@ class CLITerminalMixin:
         prev_width = getattr(self, "_last_resize_width", None)
         width_changed = new_width is not None and prev_width is not None and new_width != prev_width
         if width_changed:
+            # Budget the replay against the full chrome: the bar/rules hidden while the
+            # reflow settles come back and would push the top replayed rows into scrollback.
+            self._status_bar_suppressed_after_resize = False
             try:
-                self._clear_prompt_toolkit_screen(
+                fit = self._clear_prompt_toolkit_screen(
                     app, rebuild_scrollback=self._redraw_rebuilds_scrollback())
-                _replay_output_history()
+                _replay_output_history(fit)
             except Exception:
                 pass
+        self._status_bar_suppressed_after_resize = True
         if new_width is not None:
             self._last_resize_width = new_width
         if width_changed:
