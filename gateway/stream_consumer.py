@@ -574,23 +574,23 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                 if self._should_edit(tick) and (
                     self._accumulated or (self._use_native_streaming and self._tool_progress_active)
                 ):
+                    # Seal first: it clears the message id, so a remainder still over the limit
+                    # is split again below. A plain first send would let the adapter split it and
+                    # adopt only the LAST chunk as the preview; the next seal then overwrites that
+                    # chunk with the head of the whole remainder (duplicated + lost text, #25349).
+                    await self._seal_overflow_heads()
                     # Overflow split.  Native streaming bypasses this: the adapter
                     # truncates against the stream protocol's own limit.
                     if not self._use_native_streaming and self._first_send_overflows():
                         if await self._split_first_send(tick):
                             return
-                        continue
-                    await self._seal_overflow_heads()
-                    # Sealing clears the message id, so the gate above is stale: a remainder still
-                    # over the limit must be split again. A plain first send lets the adapter split
-                    # it and adopt only the LAST chunk as the preview; the next seal overwrites that
-                    # chunk with the head of the whole remainder (duplicated + lost text, #25349).
-                    # `continue` like the gate above: the tail is still unsent, and the segment-break
-                    # reset below would clear it.
-                    if not self._use_native_streaming and self._first_send_overflows():
-                        if await self._split_first_send(tick):
-                            return
-                        continue
+                        if self._first_send_overflows():
+                            # A head send failed: keep the full text for the fallback final, and
+                            # skip the boundary reset below that would clear it.
+                            self._signal_flush(tick.flush_event)
+                            continue
+                    # The split tail goes out now, so a commentary or tool boundary drained in
+                    # this tick still lands after it instead of being dropped.
                     await self._push_update(tick)
 
                 if tick.got_done:
@@ -792,11 +792,6 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         if tick.got_segment_break:
             self._fallback_final_send = False
             self._fallback_prefix = ""
-            if not self._accumulated:
-                return False
-        # Early `continue` skips the bottom-of-loop flush signal.
-        if tick.got_flush:
-            self._signal_flush(tick.flush_event)
         return False
 
     def _overflows(self) -> bool:

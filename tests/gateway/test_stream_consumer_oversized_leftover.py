@@ -106,3 +106,36 @@ async def test_no_tail_line_is_published_twice_across_new_messages():
         f"{len(repeated)} tail line(s) reached the channel more than once as NEW "
         f"messages (first: {repeated[:3]}) - that is the interleaved duplicate"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["commentary", "segment_break"])
+async def test_boundary_in_the_sealing_tick_still_applies(boundary):
+    """A commentary or tool boundary drained in the same tick that seals an oversized
+    tail must still take effect: commentary is delivered, and post-boundary text starts
+    a NEW message instead of being glued onto the pre-boundary preview."""
+    adapter = _make_plain_adapter()
+    sends, edits = _wire(adapter)
+    config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor="")
+    consumer = GatewayStreamConsumer(adapter, "chat_plain", config)
+    consumer.on_delta(HEAD)
+    task = asyncio.create_task(consumer.run())
+    await asyncio.sleep(0.06)
+    # Enqueued synchronously, so one drain folds TAIL and stops at the boundary.
+    consumer.on_delta(TAIL)
+    if boundary == "commentary":
+        consumer.on_commentary("COMMENTARY-MARKER")
+    consumer.on_segment_break()
+    consumer.on_delta("POST-TOOL-MARKER")
+    await asyncio.sleep(0.12)
+    consumer.finish()
+    await asyncio.wait_for(task, timeout=10)
+
+    texts = [c for c, _ in sends] + edits
+    if boundary == "commentary":
+        assert any("COMMENTARY-MARKER" in t for t in texts), "commentary was dropped"
+    glued = [t for t in texts if "POST-TOOL-MARKER" in t and "tail line" in t]
+    assert not glued, "post-boundary text was glued onto the pre-boundary preview"
+    assert any("POST-TOOL-MARKER" in t for t in texts)
+    joined = "".join(c for c, _ in sends)
+    assert all(joined.count(f"tail line {i:03d}") <= 1 for i in range(240))
