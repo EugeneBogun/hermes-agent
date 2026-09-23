@@ -581,6 +581,38 @@ class TestFinalResponseDeliveryGuard:
         )
 
 
+    @pytest.mark.asyncio
+    async def test_failed_first_send_leaves_no_uneditable_partial_preview(self):
+        """A failed first send disables edits: a preview sent after it could never be updated and
+        would stay on screen truncated next to the final. Only the complete reply reaches the chat."""
+        delivered = []
+        results = iter([SimpleNamespace(success=False, error="timeout")])
+
+        async def send(**kw):
+            result = next(results, None) or SimpleNamespace(success=True, message_id=f"m{len(delivered) + 1}")
+            if result.success:
+                delivered.append(kw["content"])
+            return result
+
+        adapter = MagicMock()
+        adapter.send = AsyncMock(side_effect=send)
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor="")
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        consumer.on_delta("preview never landed ")
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.08)
+        consumer.on_delta("and more streamed text ")
+        await asyncio.sleep(0.08)
+        consumer.on_delta("then the end.")
+        consumer.finish()
+        await asyncio.wait_for(task, timeout=10)
+
+        assert delivered == ["preview never landed and more streamed text then the end."]
+
+
 class TestFinalContentDeliveredGuard:
     """Regression coverage for #25010 — _final_content_delivered must only be
     set when the final response is actually confirmed delivered to the user,

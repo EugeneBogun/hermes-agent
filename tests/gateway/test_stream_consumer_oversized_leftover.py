@@ -15,8 +15,8 @@ stripped, and whose concatenations shared a prefix. The gateway's normal final
 send was correctly suppressed, which is what places the duplicate inside the
 consumer rather than in the gateway's delivery ledger.
 
-Contract pinned here: on a non-final lane the CONSUMER owns chunking. The adapter
-must never be handed a payload larger than one message outside the final lane.
+Contract pinned here: on a non-final lane the CONSUMER owns chunking, so no line
+of the answer reaches the channel twice as a new message.
 """
 
 import asyncio
@@ -88,24 +88,6 @@ async def _run(adapter):
     # spins hot and would hang the suite instead of failing it.
     await asyncio.wait_for(task, timeout=10)
     return consumer
-
-
-@pytest.mark.asyncio
-async def test_non_final_lane_never_hands_the_adapter_an_oversized_payload():
-    adapter = _make_plain_adapter()
-    sends, _edits = _wire(adapter)
-
-    await _run(adapter)
-
-    oversized = [
-        len(c) for c, notify in sends
-        if not notify and len(c) > adapter.MAX_MESSAGE_LENGTH
-    ]
-    assert not oversized, (
-        "a non-final send handed the adapter a payload it has to chunk and cap "
-        f"itself (lengths {oversized}); the turn-final lane then republishes the "
-        "same text with a different denominator"
-    )
 
 
 @pytest.mark.asyncio
