@@ -366,9 +366,18 @@ one of two things:
 
 - **The reply was persisted but never ledgered.** The stored transcript reply is recorded as
   an unowned ledger row and the marker is cleared; the boot sweep delivers it once with the
-  "Recovered reply" notice. The turn is not regenerated.
+  "Recovered reply" notice. The turn is not regenerated. The reply is judged the way live
+  delivery would have judged it: a bare silence marker (`[SILENT]`, `NO_REPLY`, ...) on an
+  internal turn, or the reply to a diagnostic wake the chat's policy mutes, is owed nothing
+  (the marker is cleared, nothing is sent or resumed). A human turn's bare silence marker
+  becomes the same "returned only a silence marker" notice the live path sends.
 - **No reply was persisted.** `recover_interrupted_turns()` sets `resume_pending=True`,
   `resume_reason="restart_interrupted"`, and the turn auto-resumes once.
+
+The marker's start time is stored as aware UTC and compared as epoch seconds, so a restart
+in a different local zone (DST change, container vs. unit `TZ`) neither drops a fresh marker
+as stale nor adopts the previous turn's reply as this one's. A marker written by an older
+build (naive local time) is read as host-local time.
 
 A turn already in the ledger is redelivered by the ledger sweep, which also clears any
 `resume_pending` for that session, so it is never both delivered and re-answered.

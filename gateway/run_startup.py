@@ -14,7 +14,7 @@ import logging
 import os
 import signal
 import time
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from datetime import datetime
 from pathlib import Path
@@ -723,14 +723,12 @@ class GatewayStartupMixin:
         return resumed, ledgered
 
     async def _ledger_crash_left_replies(self, max_age_seconds: int) -> int:
-        """Hand every marked turn whose final reply was persisted to the delivery ledger and clear
-        its marker, so the boot sweep delivers the stored reply instead of auto-resume
-        regenerating it. Without the ledger such turns stay marked and resume."""
+        """Settle every marked turn whose final reply was persisted and clear its marker, so
+        auto-resume does not regenerate it: a reply live delivery would have suppressed is owed
+        nothing, any other goes to the delivery ledger for the boot sweep. Without the ledger a
+        presentable reply stays marked and resumes."""
         from gateway.delivery_ledger import compute_obligation_id, ledger_enabled, record_crash_left_reply
-        from gateway.platforms.base import _strip_media_directives
-        from gateway.run import _sanitize_gateway_final_response
-        if not await asyncio.to_thread(ledger_enabled):
-            return 0
+        ledger_on = await asyncio.to_thread(ledger_enabled)
         cutoff = time.time() - max_age_seconds  # older markers are cleared, never acted on
         with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
             self.session_store._ensure_loaded_locked()  # noqa: SLF001
@@ -742,26 +740,53 @@ class GatewayStartupMixin:
             ]
         ledgered = 0
         for key, session_id, token, started_at, origin, profile in marked:
-            history = await self.async_session_store.load_transcript(session_id)
-            last = next((m for m in reversed(history) if m.get("role") not in ("session_meta", "system")), None)
-            if (started_at.timestamp() < cutoff or not last or last.get("role") != "assistant"
-                    or last.get("tool_calls")
-                    or not isinstance(last.get("content"), str)
-                    or float(last.get("timestamp") or 0) < started_at.timestamp()):
-                continue  # the turn never produced its final reply: it resumes
-            text = _strip_media_directives(
-                _sanitize_gateway_final_response(origin.platform, last["content"])).strip()
-            if not text:
+            started = started_at.timestamp()  # aware UTC marker; a pre-upgrade naive one reads as local
+            if started < cutoff:
                 continue
-            await asyncio.to_thread(
-                record_crash_left_reply,
-                obligation_id=compute_obligation_id(key, f"crash:{token}", text), session_key=key,
-                platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
-                thread_id=origin.thread_id, content=text, since=started_at.timestamp(),
-                adapter_profile=profile)
-            if await self.async_session_store.clear_turn_active(key, token):
+            text = self._crash_left_reply(await self.async_session_store.load_transcript(session_id),
+                                          started, origin)
+            if text is None or (text and not ledger_on):
+                continue  # no final reply to deliver: the turn resumes
+            if text:
+                await asyncio.to_thread(
+                    record_crash_left_reply,
+                    obligation_id=compute_obligation_id(key, f"crash:{token}", text), session_key=key,
+                    platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
+                    thread_id=origin.thread_id, content=text, since=started, adapter_profile=profile)
+            if await self.async_session_store.clear_turn_active(key, token) and text:
                 ledgered += 1
         return ledgered
+
+    def _crash_left_reply(self, history: list, started: float, origin) -> Optional[str]:
+        """What a crash-left turn owes, judged as live delivery would have: ``None`` when it never
+        persisted a final reply after *started*; ``""`` when nothing would have been presented (a
+        silence marker on a machinery turn, a muted diagnostic wake); else the text to send, with a
+        human turn's bare silence marker replaced by the same notice the live path sends."""
+        from gateway.platforms.base import _strip_media_directives
+        from gateway.response_filters import is_intentional_silence_response, is_machinery_display_kind
+        from gateway.run import _sanitize_gateway_final_response
+        from gateway.run_turn import _UNEXPECTED_SILENCE_REPLY
+        from gateway.warning_notifications import diagnostic_turn_muted
+        from hermes_cli.timefmt import coerce_epoch
+        visible = [m for m in history if m.get("role") not in ("session_meta", "system")]
+        last = visible[-1] if visible else {}
+        if (last.get("role") != "assistant" or last.get("tool_calls") or not isinstance(last.get("content"), str)
+                or (coerce_epoch(last.get("timestamp")) or 0) < started):
+            return None
+        prompt = next((m for m in reversed(visible) if m.get("role") == "user"), {})
+        machinery = is_machinery_display_kind(prompt.get("display_kind"))
+        if machinery:
+            try:  # the owning profile's display policy, as the adapter reads it at delivery
+                scope = self._media_delivery_scope_for_source(origin)
+            except Exception:
+                logger.debug("Crash-left reply: no routed scope for %s", origin.chat_id, exc_info=True)
+                scope = nullcontext()
+            with scope:
+                if diagnostic_turn_muted(prompt.get("display_metadata"), origin.platform):
+                    return ""
+        if is_intentional_silence_response(last["content"]):
+            return "" if machinery else _UNEXPECTED_SILENCE_REPLY
+        return _strip_media_directives(_sanitize_gateway_final_response(origin.platform, last["content"])).strip() or None
 
     @staticmethod
     def _start_hosted_room_worker_sync():
