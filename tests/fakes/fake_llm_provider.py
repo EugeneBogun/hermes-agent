@@ -261,10 +261,11 @@ def _handler_for(server: FakeLLMServer) -> type[BaseHTTPRequestHandler]:
             resp = server._next_main(record) if kind == "main" else server._aux(record)
             record["response"] = type(resp).__name__
             prompt_tokens = server.prompt_tokens_fn(body) if server.prompt_tokens_fn else None
-            self._respond(resp, bool(body.get("stream")), prompt_tokens)
+            self._respond(resp, bool(body.get("stream")), prompt_tokens, record)
 
         # response rendering
-        def _respond(self, resp: Response, stream: bool, prompt_tokens: int | None = None) -> None:
+        def _respond(self, resp: Response, stream: bool, prompt_tokens: int | None = None,
+                     record: dict[str, Any] | None = None) -> None:
             if isinstance(resp, Error):
                 headers = {"Retry-After": str(resp.retry_after)} if resp.retry_after is not None else {}
                 self._send_json(resp.status, {"error": {"message": resp.message, "type": "server_error"}}, headers)
@@ -295,6 +296,10 @@ def _handler_for(server: FakeLLMServer) -> type[BaseHTTPRequestHandler]:
                 self.close_connection = True
                 return
             message, finish, usage = _message_for(resp, server, prompt_tokens)
+            # What the provider billed for this request, so usage/cost accounting can be checked
+            # against state.db (faulted requests never get a ``usage`` key).
+            if record is not None:
+                record["usage"] = usage
             if not stream:
                 self._send_json(200, {
                     "id": "chatcmpl-fake", "object": "chat.completion", "created": int(time.time()),
