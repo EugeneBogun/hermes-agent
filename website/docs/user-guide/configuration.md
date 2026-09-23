@@ -170,7 +170,9 @@ Leaving these unset keeps the legacy defaults (`HERMES_API_TIMEOUT=1800`s, `HERM
 Passive update checks (CLI banner, TUI badge, dashboard, desktop app) ask the
 GitHub REST API for the tip of `main` and, when it differs from your checkout,
 the compare endpoint for the exact count and changelog. They never run
-`git fetch`, and every install asks at most **once per 24 hours** (a failed check
+`git fetch` — in a partial (`--filter=blob:none`) clone they also never
+download missing objects from the promisor remote (Git 2.44 or newer) — and
+every install asks at most **once per 24 hours** (a failed check
 retries after an hour). Applying an update (`hermes update`, or the desktop's
 Update button) always fetches fresh and invalidates the cached answer. Explicit
 checks — `hermes update --check`, the desktop's "Check for Updates…" menu item,
