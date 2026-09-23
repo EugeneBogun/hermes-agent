@@ -56,12 +56,13 @@ class ToolCall:
     """One assistant turn issuing one or more tool calls.
 
     ``calls`` may be a single ``(name, args)`` or pass ``name``/``args`` directly;
-    ``parallel`` adds more calls to the same assistant message.
+    ``parallel`` adds more calls to the same assistant message. A ``str`` args is
+    sent verbatim as the ``arguments`` string (e.g. malformed/truncated JSON).
     """
 
     name: str
-    args: dict[str, Any] = field(default_factory=dict)
-    parallel: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    args: dict[str, Any] | str = field(default_factory=dict)
+    parallel: list[tuple[str, dict[str, Any] | str]] = field(default_factory=list)
     text: str | None = None
 
 
@@ -89,7 +90,26 @@ class DropMidStream:
     after_chars: int = 12
 
 
-Response = Union[Text, ToolCall, Error, Hang, DropMidStream]
+@dataclass
+class StallMidStream:
+    """Open the SSE stream, send ``text[:after_chars]``, then go silent for ``seconds``
+    without closing (a wedged upstream that keeps the socket open)."""
+
+    text: str = "partial answer that stalls"
+    after_chars: int = 8
+    seconds: float = 3600.0
+
+
+@dataclass
+class Raw:
+    """Send an arbitrary body verbatim (malformed JSON, HTML error pages, ...)."""
+
+    body: str = "this is not json"
+    status: int = 200
+    content_type: str = "application/json"
+
+
+Response = Union[Text, ToolCall, Error, Hang, DropMidStream, StallMidStream, Raw]
 Responder = Callable[[dict[str, Any]], Response]
 
 
@@ -246,6 +266,21 @@ def _handler_for(server: FakeLLMServer) -> type[BaseHTTPRequestHandler]:
             if isinstance(resp, Hang):
                 server._stop.wait(resp.seconds)
                 return
+            if isinstance(resp, Raw):
+                body = resp.body.encode()
+                self.send_response(resp.status)
+                self.send_header("Content-Type", resp.content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if isinstance(resp, StallMidStream):
+                self._start_sse()
+                self._sse(_chunk({"role": "assistant", "content": ""}))
+                self._sse(_chunk({"content": resp.text[: resp.after_chars]}))
+                server._stop.wait(resp.seconds)
+                self.close_connection = True
+                return
             if isinstance(resp, DropMidStream):
                 self._start_sse()
                 self._sse(_chunk({"role": "assistant", "content": ""}))
@@ -331,7 +366,7 @@ def _message_for(resp: Text | ToolCall, server: FakeLLMServer) -> tuple[dict[str
     calls = [(resp.name, resp.args), *resp.parallel]
     tool_calls = [
         {"id": server.next_tool_call_id(), "type": "function",
-         "function": {"name": name, "arguments": json.dumps(args)}}
+         "function": {"name": name, "arguments": args if isinstance(args, str) else json.dumps(args)}}
         for name, args in calls
     ]
     message = {"role": "assistant", "content": resp.text, "tool_calls": tool_calls}
