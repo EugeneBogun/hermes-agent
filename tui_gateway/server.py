@@ -1222,18 +1222,19 @@ def _load_cfg_raw() -> dict:
     expansion applied here would be persisted on the next save). Behavioral reads use :func:`_load_cfg`.
     Cache keyed on the resolved path so profiles don't clobber."""
     global _cfg_cache, _cfg_sig, _cfg_path
-    with contextlib.suppress(Exception):
+    from hermes_cli.config import FailedConfigRead, read_user_config_raw
+    try:
         p = _active_config_path()
         sig = file_signature(p.stat()) if p.exists() else None
         with _cfg_lock:
             if _cfg_cache is not None and _cfg_sig == sig and _cfg_path == p:
                 return copy.deepcopy(_cfg_cache)
-        from hermes_cli.config import read_user_config_raw
         data = read_user_config_raw(p) if p.exists() else {}
-        with _cfg_lock:  # cache the RAW config: _save_cfg writes _cfg_cache back to disk
-            _cfg_cache, _cfg_sig, _cfg_path = copy.deepcopy(data), sig, p
-        return data
-    return {}
+    except Exception as exc:
+        return FailedConfigRead(error=exc)  # readable as {}, refused by _save_cfg
+    with _cfg_lock:  # cache the RAW config: _save_cfg writes _cfg_cache back to disk
+        _cfg_cache, _cfg_sig, _cfg_path = copy.deepcopy(data), sig, p
+    return data
 
 
 def _load_cfg() -> dict:
