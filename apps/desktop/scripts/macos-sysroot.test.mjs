@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, expect, it, vi } from 'vitest'
 
 vi.mock('node:child_process', () => ({
   execFileSync: vi.fn(),
@@ -14,45 +14,37 @@ afterEach(() => {
   vi.mocked(execFileSync).mockReset()
 })
 
-describe('macosSysroot', () => {
-  it('prefers an explicit SDKROOT over the developer dir', () => {
-    expect(macosSysroot({ SDKROOT: '/pinned/MacOSX.sdk' })).toBe('/pinned/MacOSX.sdk')
-    expect(execFileSync).not.toHaveBeenCalled()
-  })
+it('resolves explicit SDKs before developer defaults and preserves the no-SDK fallback', () => {
+  const developerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sysroot-'))
+  const env = { DEVELOPER_DIR: developerDir }
+  const sdk = path.join(developerDir, 'SDKs/MacOSX.sdk')
 
-  it('names the Command Line Tools SDK paired with the toolchain', () => {
-    const developerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sysroot-clt-'))
-    fs.mkdirSync(path.join(developerDir, 'SDKs/MacOSX.sdk'), { recursive: true })
+  try {
+    for (const SDKROOT of [sdk, 'macosx']) {
+      const override = { ...env, SDKROOT }
+      vi.mocked(execFileSync).mockReturnValue(`${sdk}\n`)
+      expect(macosSysroot(override)).toBe(sdk)
+      expect(execFileSync).toHaveBeenLastCalledWith('xcrun', ['--sdk', SDKROOT, '--show-sdk-path'], {
+        encoding: 'utf8', env: override
+      })
+    }
+
+    vi.mocked(execFileSync).mockImplementationOnce(() => { throw new Error('SDK not found') })
+    expect(() => macosSysroot({ ...env, SDKROOT: 'missing-sdk' })).toThrow('SDK not found')
+
     vi.mocked(execFileSync).mockReturnValue(`${developerDir}\n`)
-
-    expect(macosSysroot({})).toBe(path.join(developerDir, 'SDKs/MacOSX.sdk'))
-    fs.rmSync(developerDir, { recursive: true, force: true })
-  })
-
-  it('falls back to the Xcode platform SDK layout', () => {
-    const developerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sysroot-xcode-'))
-    const sdk = 'Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk'
-    fs.mkdirSync(path.join(developerDir, sdk), { recursive: true })
-    vi.mocked(execFileSync).mockReturnValue(`${developerDir}\n`)
-
-    expect(macosSysroot({})).toBe(path.join(developerDir, sdk))
-    fs.rmSync(developerDir, { recursive: true, force: true })
-  })
-
-  it('returns null when the developer dir ships no MacOSX.sdk', () => {
-    vi.mocked(execFileSync).mockReturnValue(`${os.tmpdir()}/sysroot-no-such-dir\n`)
-
-    expect(macosSysroot({})).toBeNull()
-  })
-})
-
-describe('xcrunClangArgv', () => {
-  it('pins the sysroot when one was resolved', () => {
-    expect(xcrunClangArgv('/sdk/MacOSX.sdk')).toEqual(['clang', '-isysroot', '/sdk/MacOSX.sdk'])
-  })
-
-  // xcrun options after `clang` would be handed to clang instead of resolving the SDK.
-  it('names the SDK before the tool when falling back', () => {
+    expect(macosSysroot(env)).toBeNull()
     expect(xcrunClangArgv(null)).toEqual(['--sdk', 'macosx', 'clang'])
-  })
+
+    // When both layouts exist, the CLT default wins over the Xcode platform fallback.
+    for (const relative of ['Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk', 'SDKs/MacOSX.sdk']) {
+      const paired = path.join(developerDir, relative)
+      fs.mkdirSync(paired, { recursive: true })
+      expect(macosSysroot(env)).toBe(paired)
+      expect(execFileSync).toHaveBeenLastCalledWith('xcode-select', ['-p'], { encoding: 'utf8', env })
+      expect(xcrunClangArgv(paired)).toEqual(['clang', '-isysroot', paired])
+    }
+  } finally {
+    fs.rmSync(developerDir, { recursive: true, force: true })
+  }
 })
