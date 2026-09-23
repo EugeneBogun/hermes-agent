@@ -152,7 +152,7 @@ jobs:
 
   e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -212,9 +212,12 @@ jobs:
         run: uv cache prune --ci
 
       - name: Run e2e tests
+        # One subprocess per file, in parallel: the core suites spawn real
+        # processes (serve, gateway, tui_gateway, MCP servers, SQLite writers)
+        # and must not share interpreter state.
         run: |
           source .venv/bin/activate
-          python -m pytest tests/e2e/ -v --tb=short
+          scripts/run_tests.sh --include-integration tests/e2e
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
