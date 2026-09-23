@@ -199,15 +199,16 @@ def _list_diff(a: list[tuple], b: list[tuple], an: str, bn: str) -> str:
     return "\n".join(lines)
 
 
-def prefix_breaks(requests: list[dict[str, Any]]) -> list[tuple[int, str]]:
+def prefix_breaks(requests: list[dict[str, Any]], *, tools: bool = True) -> list[tuple[int, str]]:
     """(C17) Indices i where request i is NOT a byte-identical extension of request i-1.
 
-    Byte-stability covers the tools array, the system prompt and every earlier message.
+    Byte-stability covers the tools array (unless ``tools=False``), the system prompt and every
+    earlier message.
     """
     breaks = []
     for i in range(1, len(requests)):
         prev, cur = requests[i - 1], requests[i]
-        if canon(prev.get("tools")) != canon(cur.get("tools")):
+        if tools and canon(prev.get("tools")) != canon(cur.get("tools")):
             breaks.append((i, "tools array changed: " + tools_diff(prev.get("tools"), cur.get("tools"))))
             continue
         pm, cm = prev["messages"], cur["messages"]
@@ -220,6 +221,13 @@ def prefix_breaks(requests: list[dict[str, Any]]) -> list[tuple[int, str]]:
                 breaks.append((i, f"messages[{j}] ({a.get('role')}) changed; {first_divergence(ca, cb)}"))
                 break
     return breaks
+
+
+def tools_breaks(requests: list[dict[str, Any]]) -> list[tuple[int, str]]:
+    """Indices i where request i sends a different tools array than request i-1."""
+    return [(i, tools_diff(requests[i - 1].get("tools"), requests[i].get("tools")))
+            for i in range(1, len(requests))
+            if canon(requests[i - 1].get("tools")) != canon(requests[i].get("tools"))]
 
 
 def tools_diff(a: Any, b: Any) -> str:
@@ -502,25 +510,42 @@ class TuiGateway:
 
 class Script:
     """Main-turn responder: pops scripted actions; an action may be a callable run AT request
-    arrival (so /steer and interrupt land while the request is genuinely in flight)."""
+    arrival (so /steer and interrupt land while the request is genuinely in flight).
+
+    Callables run on the fake provider's HTTP handler thread, where a raised assertion only drops
+    the connection (the agent retries and the test moves on). ``errors`` keeps every such failure
+    so the test re-raises it on its own thread (``raise_errors``)."""
 
     def __init__(self) -> None:
         self.actions: list[Any] = []
         self.n = 0
         self.session: Any = None
         self.steered: list[str] = []
+        self.errors: list[str] = []
 
     def __call__(self, record: dict[str, Any]) -> Any:
         self.n += 1
         if self.actions:
             act = self.actions.pop(0)
-            return act(record) if callable(act) else act
+            if not callable(act):
+                return act
+            try:
+                return act(record)
+            except BaseException:
+                import traceback
+
+                self.errors.append(traceback.format_exc())
+                raise
         # Unique text + varying usage per answer, so a duplicated row or a double-counted
         # request is always distinguishable.
         from tests.fakes.fake_llm_provider import Text
 
         return Text(f"answer #{self.n}", prompt_tokens=900 + 13 * self.n, completion_tokens=5 + self.n,
                     cached_tokens=400 + self.n)
+
+    def raise_errors(self, where: str) -> None:
+        assert not self.errors, f"{where}: a scripted action failed on the provider thread:\n" + "\n".join(
+            self.errors)
 
 
 def big(label: str, n: int = 12000) -> str:

@@ -80,9 +80,15 @@ class ParityHome:
         """Hermetic env for a subprocess Hermes: fake HOME, no real credentials."""
         import pwd  # POSIX-only; the suite is Linux-gated
 
+        # Refuse only a home the real install would read as live state (its root or a profile).
+        # A tmp_path under ``~/.hermes/cache/scratch`` (TMPDIR when Hermes itself runs the suite)
+        # is fine: the child's HOME is the fixture home, so its ``~/.hermes`` never resolves there.
         real_root = Path(pwd.getpwuid(os.getuid()).pw_dir, ".hermes").resolve()
-        assert real_root not in (self.hermes_home.resolve(), *self.hermes_home.resolve().parents), (
-            f"fixture HERMES_HOME {self.hermes_home} is inside the real {real_root}")
+        fixture = self.hermes_home.resolve()
+        assert fixture != real_root and fixture.parent != real_root / "profiles", (
+            f"fixture HERMES_HOME {self.hermes_home} is the real install's live home")
+        assert fixture == (self.home / ".hermes").resolve(), (
+            f"fixture HERMES_HOME {self.hermes_home} is not <fixture HOME>/.hermes")
         # Allowlist, not denylist: the runner may itself be a Hermes process whose
         # TERMINAL_CWD / HERMES_* / credential env would silently reroute the child.
         env = {
@@ -168,6 +174,7 @@ def build_parity_home(root: Path, base_url: str, *, grandchild: bool = True,
     cfg["mcp_single_query_discovery_timeout"] = 120
     # Keep turns hermetic and short: no title/aux model chatter decides anything here.
     cfg.setdefault("display", {})["compact"] = True
+    cfg["updates"] = {"check": False}  # offline: no GitHub round-trip or git lazy fetch
     (hermes_home / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
 
     hooks_dir = hermes_home / "agent-hooks"

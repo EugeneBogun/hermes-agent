@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from tests.e2e.core.chaos import _gateway_fake_platform as fake_platform
-from tests.e2e.core.chaos._helpers import hermetic_env, python_exe, write_chaos_home
+from tests.e2e.core.chaos._helpers import hermetic_env, kill_tagged, python_exe, write_chaos_home
 
 BOOT_DEADLINE_S = 180.0
 SHUTDOWN_DEADLINE_S = 60.0
@@ -112,9 +112,11 @@ class GatewayProc:
             "HERMES_STATE_DB_GUARD_BYPASS": "1",
         })
         log = open(self.log_path, "wb")
+        # Same process group as pytest (no start_new_session): when the runner kills a timed-out
+        # file's group, the gateway goes with it instead of outliving the run.
         self.proc = subprocess.Popen(
             [python_exe(), "-m", "gateway.run"], cwd=str(self.home), env=env,
-            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
         log.close()
         deadline = time.monotonic() + BOOT_DEADLINE_S
         while True:
@@ -169,8 +171,9 @@ class GatewayProc:
             self.shutdown_s = time.monotonic() - t0
         except subprocess.TimeoutExpired:
             self.shutdown_s = None
+            kill_tagged(self.tag)
             with _suppress_oserror():
-                os.killpg(self.proc.pid, signal.SIGKILL)
+                self.proc.kill()
             self.exit_code = self.proc.wait(timeout=30)
         finally:
             for sock in (self._conn, self._listener):

@@ -288,9 +288,17 @@ def _assert_heartbeat(scn: Scenario, hb: Heartbeat, stats: dict[str, Any], turn_
         f"{scn.id}: only {len(hb.latencies)} heartbeats answered in a {turn_s:.1f}s turn")
 
 
+class ToolOutlivedGateway(Exception):
+    """The in-flight tool outlived the gateway's exit: its process tree survives and/or its
+    tool_call was left with no result in state.db. Deliberately NOT an AssertionError: the
+    known-bug xfail matches only this, so an RPC failure, a crash or any other broken invariant
+    (heartbeat, exit deadline, integrity) still fails the test."""
+
+
 def _exit_mid_turn(scn: Scenario, gw: TuiGatewayProcess, hb: Heartbeat, tag: str,
                    state_db: Path, stored: str, stats: dict[str, Any]) -> dict[str, Any]:
-    """The client vanishes (stdin EOF) or the supervisor stops us (SIGTERM) mid-wedge."""
+    """The client vanishes (stdin EOF) or the supervisor stops us (SIGTERM) mid-wedge.
+    Every other invariant is asserted first; the tool leftovers are checked together, last."""
     _assert_heartbeat(scn, hb, stats, turn_s=LONG_TIMEOUT_S)
     t0 = time.monotonic()
     if scn.action == "sigterm":
@@ -303,11 +311,14 @@ def _exit_mid_turn(scn: Scenario, gw: TuiGatewayProcess, hb: Heartbeat, tag: str
         rc = gw.close_stdin_and_wait(EXIT_TIMEOUT_S)
     assert rc is not None, f"{scn.id}: gateway still alive {EXIT_TIMEOUT_S}s after {scn.action} mid-turn{gw.tail()}"
     stats["exit_s"] = round(time.monotonic() - t0, 2)
-    survivors = wait_no_tagged(tag)
-    assert survivors == [], f"{scn.id}: orphans after {scn.action} mid-turn: {describe_pids(survivors)}"
     assert integrity_ok(state_db) == "ok"
-    assert unanswered_tool_calls(persisted_messages(state_db, stored)) == [], (
-        f"{scn.id}: state.db keeps a tool_call with no result after {scn.action} (next resume sends it)")
+    leftovers = []
+    if dangling := unanswered_tool_calls(persisted_messages(state_db, stored)):
+        leftovers.append(f"state.db keeps tool_call(s) {dangling} with no result (next resume sends them)")
+    if survivors := wait_no_tagged(tag):
+        leftovers.append(f"orphans: {describe_pids(survivors)}")
+    if leftovers:
+        raise ToolOutlivedGateway(f"{scn.id} after {scn.action} mid-turn: " + "; ".join(leftovers))
     return stats
 
 
@@ -448,10 +459,13 @@ def scenario_futures(request: pytest.FixtureRequest, tmp_path_factory: pytest.Te
 # Real production bug on base (reported, not fixed here): when the gateway leaves mid-tool —
 # client closes stdin or supervisor SIGTERMs — _shutdown_sessions() closes the agents but the
 # in-flight foreground terminal command (its own process group) is never killed, so the
-# `bash -c ...` + `sleep 3600` tree survives, reparented to init. strict: flips red once fixed.
+# `bash -c ...` + `sleep 3600` tree survives, reparented to init, and its tool_call is left with
+# no result in state.db. strict: flips red once fixed. raises= names only the leftovers check's
+# exception, so everything before it is asserted normally.
 _ORPHANED_FOREGROUND_TOOL = pytest.mark.xfail(
-    strict=True, raises=AssertionError,
-    reason="tui_gateway exit (EOF/SIGTERM) orphans the running foreground terminal tool's process tree")
+    strict=True, raises=ToolOutlivedGateway,
+    reason="tui_gateway exit (EOF/SIGTERM) orphans the running foreground terminal tool's process tree "
+           "and leaves its tool_call without a result")
 KNOWN_BUGS = {"stdin_eof_during_hung_tool": _ORPHANED_FOREGROUND_TOOL,
               "sigterm_during_hung_tool": _ORPHANED_FOREGROUND_TOOL}
 

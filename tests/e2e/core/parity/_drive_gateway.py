@@ -204,30 +204,54 @@ def _http(method: str, url: str, *, key: str | None = None, body: dict | None = 
         return exc.code, exc.read().decode("utf-8", "replace")
 
 
+PORT_ATTEMPTS = 3
+
+
+def _await_own_api_server(proc: subprocess.Popen, base: str, key: str) -> bool:
+    """True once OUR child answers on ``base`` (authenticated ``/health/detailed`` reporting its
+    pid, so a stranger that grabbed the port is never mistaken for it); False when the child
+    reports the port taken. The port is picked free and then released before the child binds
+    it, so another process can win that race."""
+    deadline = time.monotonic() + TURN_TIMEOUT
+    while True:
+        if "already in use" in _log_tail(proc, 20000):
+            return False
+        if proc.poll() is not None:
+            raise AssertionError(f"api server exited {proc.returncode} before ready\n{_log_tail(proc)}")
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"api server never became ready on {base}\n{_log_tail(proc)}")
+        with contextlib.suppress(OSError, urllib.error.URLError, ValueError):
+            status, raw = _http("GET", f"{base}/health/detailed", key=key, timeout=2.0)
+            if status == 200 and json.loads(raw).get("pid") == proc.pid:
+                return True
+        time.sleep(0.2)
+
+
 def drive_api_server(ph: ParityHome, srv: FakeLLMServer, prompt: str) -> DriveResult:
     ph.pin_terminal_cwd()
-    port = _free_loopback_port()
     key = secrets.token_hex(32)
-    _append_env(ph, {"API_SERVER_ENABLED": "true", "API_SERVER_KEY": key,
-                     "API_SERVER_HOST": "127.0.0.1", "API_SERVER_PORT": str(port)})
-    proc = _spawn(ph, [sys.executable, "-m", "gateway.run"], "api_server.stderr.log")
-    base = f"http://127.0.0.1:{port}"
+    env_before = (ph.hermes_home / ".env").read_text(encoding="utf-8") if (ph.hermes_home / ".env").exists() else ""
+    for _attempt in range(PORT_ATTEMPTS):
+        port = _free_loopback_port()
+        (ph.hermes_home / ".env").write_text(env_before, encoding="utf-8")
+        _append_env(ph, {"API_SERVER_ENABLED": "true", "API_SERVER_KEY": key,
+                         "API_SERVER_HOST": "127.0.0.1", "API_SERVER_PORT": str(port)})
+        proc = _spawn(ph, [sys.executable, "-m", "gateway.run"], "api_server.stderr.log")
+        base = f"http://127.0.0.1:{port}"
+        try:
+            ready = _await_own_api_server(proc, base, key)
+        except BaseException:
+            _stop(ph, proc)
+            raise
+        if ready:
+            break
+        _stop(ph, proc)
+    else:
+        raise AssertionError(f"api server lost the port race {PORT_ATTEMPTS} times\n{_log_tail(proc)}")
     status: int | None = None
     payload: dict[str, Any] = {}
     graceful = False
     try:
-        deadline = time.monotonic() + TURN_TIMEOUT
-        while True:
-            if proc.poll() is not None:
-                raise AssertionError(f"api server exited {proc.returncode} before ready\n{_log_tail(proc)}")
-            if time.monotonic() >= deadline:
-                raise AssertionError(f"api server never became ready on {base}\n{_log_tail(proc)}")
-            try:
-                if _http("GET", f"{base}/health", timeout=2.0)[0] == 200:
-                    break
-            except (OSError, urllib.error.URLError):
-                pass
-            time.sleep(0.2)
         status, raw = _http(
             "POST", f"{base}/v1/chat/completions", key=key, timeout=TURN_TIMEOUT,
             body={"model": "hermes-agent", "messages": [{"role": "user", "content": prompt}],

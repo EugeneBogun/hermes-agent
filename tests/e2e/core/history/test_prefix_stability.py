@@ -38,6 +38,7 @@ from tests.e2e.core.history._helpers import (
     prefix_breaks,
     row_counts,
     run_oneshot,
+    tools_breaks,
     views,
 )
 from tests.fakes.fake_llm_provider import FakeLLMServer, Text, ToolCall, write_hermes_home
@@ -89,6 +90,11 @@ KNOWN_BROKEN = {
         "(3) `-q --resume` prunes skill_manage (agent/oneshot_footprint.py) whenever the stored "
         "prompt is rebuilt, and persists the pruned pin."),
 }
+
+
+class ToolsArrayDrift(Exception):
+    """The tools array changed between requests of one session. Not an AssertionError: the
+    known-bug xfail matches only this, so every other invariant still fails the test."""
 
 
 @pytest.fixture
@@ -172,7 +178,7 @@ def run_journey(world: dict, hops: list[Hop]) -> tuple[str, list[tuple[int, str]
 
 
 @pytest.mark.parametrize("journey", [
-    pytest.param(name, marks=pytest.mark.xfail(strict=True, reason=KNOWN_BROKEN[name]))
+    pytest.param(name, marks=pytest.mark.xfail(strict=True, raises=ToolsArrayDrift, reason=KNOWN_BROKEN[name]))
     if name in KNOWN_BROKEN else name
     for name in JOURNEYS
 ])
@@ -185,7 +191,9 @@ def test_request_prefix_is_byte_stable_across_processes(world, journey):
     def where(i: int) -> str:
         return f"request {i} (in {max((o for o in openings if o[0] <= i), default=(0, '?'))[1]})"
 
-    breaks = prefix_breaks(main)
+    # System prompt + messages first; the tools array is checked last, on its own, so a known
+    # tools-drift xfail cannot mask a message-prefix, usage or integrity regression.
+    breaks = prefix_breaks(main, tools=False)
     unexpected = [(i, why) for i, why in breaks if i != compaction_idx]
     assert not unexpected, "prompt-cache prefix broke outside the compaction boundary:\n" + "\n".join(
         f"  {where(i)}: {why}" for i, why in unexpected)
@@ -195,3 +203,8 @@ def test_request_prefix_is_byte_stable_across_processes(world, journey):
 
     assert_usage_matches(home, lineage(home, sid), srv.requests, f"after journey {journey}")
     integrity_ok(home)
+
+    drift = [(i, why) for i, why in tools_breaks(main) if i != compaction_idx]
+    if drift:
+        raise ToolsArrayDrift("tools array changed within one session:\n" + "\n".join(
+            f"  {where(i)}: {why}" for i, why in drift))

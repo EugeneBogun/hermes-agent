@@ -393,11 +393,15 @@ class Run:
         log = hermes_home / "logs" / "agent.log"
         if rep["orphans"] and log.exists():
             rep["agent_log_tail"] = log.read_text(errors="replace")[-6000:]
+        # Stale-kill timeline: tells a PROBE refused by the cross-turn breaker apart from a slow probe.
+        rep["stale_log"] = [ln[:110] for ln in (log.read_text(errors="replace").splitlines() if log.exists() else [])
+                            if "stale" in ln.lower() and ("WARNING" in ln or "ERROR" in ln)][-12:]
         db = hermes_home / "state.db"
         rep["persisted"] = persisted_messages(db, self.session_id) if db.exists() else None
         rep["integrity"] = integrity_ok(db) if db.exists() else "missing"
         probes = self.probe_requests()
         rep["probe_request"] = probes[-1] if probes else None
+        rep["probe_count"] = len(probes)
         mains = [r["body"] for r in list(self.srv.requests) if r["kind"] == "main"]
         rep["last_request"] = mains[-1] if mains else None
         rep["max_request_bytes"] = max((len(json.dumps(b)) for b in mains), default=0)
@@ -471,7 +475,9 @@ def test_agent_turn_liveness(scenario_id: str, runs: dict[str, Future]) -> None:
         assert rep["probe_request"] is None, "a tripped stale breaker still billed the provider"
         sent = rep["last_request"]["messages"]
     else:
-        assert f"alive {rep_nonce(rep)}" in rep["turn1"]["final"], f"PROBE not answered: {rep['turn1']}"
+        assert f"alive {rep_nonce(rep)}" in rep["turn1"]["final"], (
+            f"PROBE not answered: {rep['turn1']}\nfault calls {rep['fault_calls']}, probe requests "
+            f"{rep['probe_count']}, stale log:\n" + "\n".join(rep.get("stale_log", [])))
         assert rep["probe_request"] is not None, "PROBE never reached the provider"
         sent = rep["probe_request"]["messages"]
         assert any(f"[[chaos:{scenario_id}]]" in _text(m.get("content")) for m in sent if m.get("role") == "user"), \

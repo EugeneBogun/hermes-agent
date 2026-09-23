@@ -142,6 +142,8 @@ def write_home(hermes_home: Path, base_url: str, extra_config: str) -> None:
         f"  context_length: {CONTEXT_LENGTH}\n"
         "agent:\n"
         "  api_max_retries: 1\n"
+        "updates:\n"
+        "  check: false\n"  # offline: no GitHub round-trip or git lazy fetch from a test surface
         + extra_config,
         encoding="utf-8",
     )

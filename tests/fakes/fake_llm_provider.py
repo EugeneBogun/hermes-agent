@@ -78,7 +78,7 @@ class Error:
 
 @dataclass
 class Hang:
-    """Accept the request and never answer within ``seconds``."""
+    """Accept the request and never answer; the connection is dropped after ``seconds``."""
 
     seconds: float = 3600.0
 
@@ -272,6 +272,9 @@ def _handler_for(server: FakeLLMServer) -> type[BaseHTTPRequestHandler]:
                 return
             if isinstance(resp, Hang):
                 server._stop.wait(resp.seconds)
+                # Drop the socket at the deadline: on a kept-alive HTTP/1.1 connection the client
+                # would otherwise wait for a response that never comes, far past ``seconds``.
+                self.close_connection = True
                 return
             if isinstance(resp, Raw):
                 body = resp.body.encode()

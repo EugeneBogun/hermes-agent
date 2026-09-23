@@ -197,6 +197,9 @@ jobs:
           # time, but resolves from the warm cache instead of re-downloading
           # and re-building wheels.
           enable-cache: true
+          # Own cache entry: the unit job's older uv would otherwise share and
+          # overwrite this key with a cache this uv version did not write.
+          cache-suffix: e2e
           cache-dependency-glob: |
             pyproject.toml
             uv.lock
@@ -241,6 +244,10 @@ jobs:
           # Multi-process episodes (torture chamber, compaction kill -9,
           # gateway liveness) legitimately run past the 300 s default.
           HERMES_TEST_FILE_TIMEOUT: "900"
+          # No automatic re-run of a failed file: the torture chamber and the
+          # exactly-once/compaction suites are race detectors, and a rare
+          # corruption that passes on retry is still a corruption.
+          HERMES_TEST_FILE_RETRIES: "0"
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""

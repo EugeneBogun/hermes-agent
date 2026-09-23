@@ -31,6 +31,7 @@ Randomness (ack thresholds, kill points) is seeded per episode; the seed is in e
 
 from __future__ import annotations
 
+import contextlib
 import os
 import random
 import sqlite3
@@ -346,10 +347,15 @@ def test_torture_episode(chamber, episode):
     before = counts(chamber.db) if chamber.db.exists() else {"__total__": 0}
     started = time.monotonic()
 
-    runs = EPISODES[episode](chamber, episode, rng)
-
-    # Nothing but the long-lived reader may still be running on the file.
-    stragglers = [n for n, _p in chamber.live() if n != chamber.reader_name]
+    try:
+        runs = EPISODES[episode](chamber, episode, rng)
+    finally:
+        # Nothing but the long-lived reader may still be running on the file. Stop the rest either
+        # way: the chamber is shared, so a failed episode's writers must not fail every later one.
+        stragglers = [n for n, _p in chamber.live() if n != chamber.reader_name]
+        for name in stragglers:
+            with contextlib.suppress(AssertionError):
+                chamber.stop(name, deadline=30.0)
     assert not stragglers, f"{ctx} roles still running: {stragglers}"
     problems: list[str] = []
     problems += [f"{n}: {e.get('error')}\n{e.get('tb', '')}" for n, e in chamber.errors()]

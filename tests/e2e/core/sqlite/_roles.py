@@ -80,7 +80,10 @@ def _patient(a: dict, out: Out, op: str, fn, *, deadline: float = 90.0):
         try:
             return fn()
         except sqlite3.OperationalError as exc:
-            busy = any(m in str(exc).lower() for m in ("database is locked", "database is busy"))
+            # By result code, not text: SQLITE_BUSY also surfaces as "vtable constructor failed:
+            # messages_fts" when the FTS5 table's config read hits the lock during an open.
+            busy = getattr(exc, "sqlite_errorcode", None) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED) or any(
+                m in str(exc).lower() for m in ("database is locked", "database is busy"))
             if not (busy and a.get("busy_ok")) or time.monotonic() > end:
                 raise
             out.report(event="busy", op=op, error=repr(exc))

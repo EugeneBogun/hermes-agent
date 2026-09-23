@@ -90,6 +90,10 @@ def chaos_config(
         "memory:\n"
         "  memory_enabled: false\n"
         "  user_profile_enabled: false\n"
+        # Offline: the passive update check does a GitHub round-trip and, on a partial clone
+        # whose objects lag upstream, spawns a git lazy fetch that outlives the gateway.
+        "updates:\n"
+        "  check: false\n"
         + extra
     )
 

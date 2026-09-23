@@ -20,6 +20,7 @@ prefix at the declared compaction boundaries (C17).
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -61,6 +62,11 @@ from tests.fakes.fake_llm_provider import (
 
 
 Step = tuple[str, Any]
+STEER_TEXT = "also mention the steer marker"
+INTERRUPTED_TURN = "this request gets interrupted"
+# The interrupted request hangs HANG_S and then drops; a working interrupt ends the turn long before.
+INTERRUPT_HANG_S = 60.0
+INTERRUPT_DEADLINE_S = 30.0
 
 
 def bulky(*labels: str) -> list[Step]:
@@ -87,7 +93,7 @@ def _interrupt_during_request(script: Script) -> Callable[[dict], Any]:
         import threading
 
         threading.Thread(target=script.session.agent.interrupt, daemon=True).start()
-        return Hang(seconds=60)
+        return Hang(seconds=INTERRUPT_HANG_S)
     return act
 
 
@@ -110,13 +116,13 @@ def scenario(name: str, script: Script) -> list[Step]:
     if name == "steer":
         return [("turn", "warm up"),
                 ("script", [_steer_then(ToolCall("terminal", {"command": "echo steered-tool"}),
-                                        "also mention the steer marker", s), Text("steer seen")]),
+                                        STEER_TEXT, s), Text("steer seen")]),
                 ("turn", "do a tool while I steer"),
                 ("turn", "after the steer")]
     if name == "interrupt":
         return [("turn", "warm up"),
                 ("script", [_interrupt_during_request(s)]),
-                ("turn", "this request gets interrupted"),
+                ("turn", INTERRUPTED_TURN),
                 ("turn", "the follow-up after the interrupt"),
                 ("turn", "one more")]
     if name == "stream_faults":
@@ -206,9 +212,17 @@ def test_transcript_ledger(world, name):
                 script.actions.extend(arg)
             elif kind == "turn":
                 ledger.inputs.append(arg)
+                t0 = time.monotonic()
                 result = session.turn(arg)
+                took = time.monotonic() - t0
+                script.raise_errors(label)
                 ledger.inputs += [x for x in script.steered if x not in ledger.inputs]
-                assert result.get("final_response") is not None or name == "interrupt", f"{label}: {result}"
+                if arg == INTERRUPTED_TURN:
+                    assert result.get("interrupted") is True and took < INTERRUPT_DEADLINE_S, (
+                        f"{label}: interrupt did not end the hung request (interrupted="
+                        f"{result.get('interrupted')!r} after {took:.1f}s)")
+                else:
+                    assert result.get("final_response") is not None, f"{label}: {result}"
                 compaction = name == "micro_compaction" or (
                     name == "auto_compaction" and arg == "the turn that must compact first")
                 ledger.step(session.sid, label, compaction=compaction)
@@ -220,6 +234,9 @@ def test_transcript_ledger(world, name):
                     f"{res.before_tokens}->{res.after_tokens} tokens")
                 ledger.step(session.sid, label, compaction=True, turn=False)
         sid = session.sid
+        if name == "steer":
+            # The ledger's inputs check then requires the steer row shown exactly once.
+            assert script.steered == [STEER_TEXT], f"the steer never landed: {script.steered}"
     finally:
         session.close()
     assert not script.actions, f"scripted responses never consumed: {script.actions}"

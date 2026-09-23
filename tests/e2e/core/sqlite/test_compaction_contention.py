@@ -28,6 +28,7 @@ turns. Invariants after every episode:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import random
 import re
@@ -271,6 +272,11 @@ def test_compaction_episode(rig, fault):
     finally:
         sampler.stop.set()
         sampler.join(timeout=10)
+        # The rig is shared by every fault: a failed episode's live roles must not leak into the next.
+        for name, _proc in ch.live():
+            if name.startswith(fault):
+                with contextlib.suppress(AssertionError):
+                    ch.stop(name, deadline=30.0)
 
     problems: list[str] = []
     problems += [f"{n}: {e.get('error')}\n{e.get('tb', '')}" for n, e in ch.errors() if n.startswith(fault)]
