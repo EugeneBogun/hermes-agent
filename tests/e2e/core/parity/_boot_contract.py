@@ -51,4 +51,3 @@ def desktop_parse(stdout_bytes: str) -> dict:
     )
     assert proc.returncode == 0, f"desktop parser bridge crashed: {proc.stderr[-2000:]}"
     return json.loads(proc.stdout.strip().splitlines()[-1])
-
