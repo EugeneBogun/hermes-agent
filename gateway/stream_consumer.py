@@ -926,9 +926,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         continuation goes out once via _send_fallback_final."""
         if self._cumulative_transport():
             return
-        # If the segment-break edit didn't land (flood control / fallback mode),
-        # _accumulated holds unseen pre-boundary text — flush it before the reset.
-        if (self._accumulated and not tick.update_visible and self._message_id
+        # If the segment-break edit or send didn't land (flood control / fallback mode, or a
+        # failed first send of a split tail with no message id yet), _accumulated holds unseen
+        # pre-boundary text — flush it before the reset clears it.
+        if (self._accumulated and not tick.update_visible
                 and self._message_id != "__no_edit__"):
             await self._flush_segment_tail_on_edit_failure()
         self._reset_segment_state(preserve_no_edit=True)
