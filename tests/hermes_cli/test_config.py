@@ -918,8 +918,8 @@ class TestConfigSupportFloor:
     _V20_EXPECTED = {
         "_config_version": 33,
         # v31 writes verify_on_stop=False, but False now equals the schema
-        # default (opt-in) so the write invariant strips it from disk.
-        "agent": {},
+        # default (opt-in) so the write invariant strips it, and the emptied
+        # section goes with it (it survived only as the phantom `agent: {}`).
         "model": {"default": "anthropic/claude-fable-5", "provider": "nous"},
         "model_catalog": {},
         "plugins": {"disabled": ["foo"], "enabled": []},

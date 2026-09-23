@@ -1902,7 +1902,8 @@ def _normalize_max_turns_config(config: Dict[str, Any]) -> Dict[str, Any]:
     agent_config = dict(config.get("agent") or {})
     if "max_turns" in config and "max_turns" not in agent_config:
         agent_config["max_turns"] = config["max_turns"]
-    config["agent"] = agent_config
+    if agent_config or "agent" in config:  # a sparse save must not grow an `agent: {}` section
+        config["agent"] = agent_config
     config.pop("max_turns", None)
     return config
 

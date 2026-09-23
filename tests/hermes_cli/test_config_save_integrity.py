@@ -35,6 +35,7 @@ def test_authored_nulls_survive_config_writes(tmp_path, monkeypatch, operation):
     assert raw["prompt_caching"]["cache_ttl"] is None
     assert raw["x_null_preservation"] == seed["x_null_preservation"]
     assert "terminal" not in raw
+    assert "agent" not in raw  # no section the user never wrote, not even an empty one
     assert configured_nofile_soft_limit() is None
     assert prompt_caching_disabled_from_config() is True
     if operation == "migrate":
