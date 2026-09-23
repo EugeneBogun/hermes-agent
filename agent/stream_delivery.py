@@ -10,7 +10,7 @@ from typing import Any, Dict, List
 
 from agent.memory_manager import sanitize_context
 from agent.message_content import flatten_message_text
-from agent.redact import redact_sensitive_text
+from agent.history_commentary import visible_commentary
 
 # Same logger name as the origin module so log records / caplog filters are unchanged.
 logger = logging.getLogger("run_agent")
@@ -75,6 +75,7 @@ class StreamDeliveryMixin:
         if ctx_scrubber is not None:
             deliver(ctx_scrubber.flush())
         self._current_streamed_assistant_text = ""
+        self._response_reasoning_delivered = False
 
     @property
     def _current_streamed_assistant_text(self) -> str:
@@ -135,8 +136,7 @@ class StreamDeliveryMixin:
 
     def _visible_commentary(self, text: str) -> str:
         """Think-stripped, redacted commentary text ("" when nothing visible remains)."""
-        visible = self._strip_think_blocks(text).strip()
-        return redact_sensitive_text(visible) if visible else visible
+        return visible_commentary(text, strip_thinking=self._strip_think_blocks)
 
     def _extract_codex_interim_visible_text(self, assistant_msg: Dict[str, Any]) -> str:
         """All visible Codex commentary joined, for comparison/fallback."""
@@ -324,7 +324,8 @@ class StreamDeliveryMixin:
             # content deltas.
             self._note_dropped_stream_writer("_fire_reasoning_delta")
             return
-        self._call_quietly(self.reasoning_callback, text)
+        if self._call_quietly(self.reasoning_callback, text) and text:
+            self._response_reasoning_delivered = True
         # Resolve the opt-in once per stream, not per token: each lookup took _CONFIG_LOCK and
         # serialized every streaming thread in the process behind a config cache hit.
         enabled = getattr(self, "_stream_reasoning_hooks_enabled", None)

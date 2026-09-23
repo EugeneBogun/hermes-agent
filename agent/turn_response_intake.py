@@ -99,19 +99,37 @@ def _fire_post_api_request_hook(
         pass
 
 
-def _relay_thinking(agent: Any, content: str) -> None:
-    """Relay the model's text to the progress callback: subagents send the first line to
-    the parent display; any agent with a structured callback gets ``reasoning.available``."""
-    _think_text = _REASONING_TAG_RE.sub('', content.strip()).strip()
-    first_line = _think_text.split('\n')[0][:80] if _think_text else ""
-    if first_line and getattr(agent, '_delegate_depth', 0) > 0:
+def _relay_response_progress(agent: Any, assistant_message: Any) -> None:
+    """Keep child status summaries separate from complete reasoning snapshots.
+
+    Only successful reasoning delivery for this response suppresses its snapshot;
+    installed callbacks alone do not prove streaming happened. Prefer the dedicated
+    callback, otherwise use progress, without ever promoting public answer text.
+    """
+    if getattr(agent, '_delegate_depth', 0) > 0:
+        content = assistant_message.content or ""
+        summary = _REASONING_TAG_RE.sub('', content.strip()).strip()
+        first_line = summary.split('\n')[0][:80] if summary else ""
+        if first_line:
+            try:
+                agent.tool_progress_callback("_thinking", first_line)
+            except Exception:
+                pass
+        return
+    if getattr(agent, "_response_reasoning_delivered", False):
+        return
+    reasoning = agent._extract_reasoning(assistant_message)
+    if reasoning:
+        if getattr(agent, "reasoning_callback", None):
+            try:
+                agent.reasoning_callback(reasoning)
+                agent._response_reasoning_delivered = True
+                return
+            except Exception:
+                pass
         try:
-            agent.tool_progress_callback("_thinking", first_line)
-        except Exception:
-            pass
-    elif _think_text:
-        try:
-            agent.tool_progress_callback("reasoning.available", "_thinking", _think_text[:500], None)
+            agent.tool_progress_callback("reasoning.available", "_thinking", reasoning, None)
+            agent._response_reasoning_delivered = True
         except Exception:
             pass
 
@@ -151,8 +169,8 @@ def normalize_model_response(
             agent._vprint(f"{agent.log_prefix}🤖 Assistant: {content}")
         else:
             agent._vprint(f"{agent.log_prefix}🤖 Assistant: {content[:100]}{'...' if len(content) > 100 else ''}")
-    if content and agent.tool_progress_callback:
-        _relay_thinking(agent, content)
+    if agent.tool_progress_callback:
+        _relay_response_progress(agent, assistant_message)
 
     # Incomplete <REASONING_SCRATCHPAD> (opened, never closed): the model ran out of
     # output tokens mid-reasoning — retry up to 2 times, then save as partial.

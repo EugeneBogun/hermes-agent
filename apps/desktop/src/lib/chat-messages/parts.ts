@@ -211,9 +211,13 @@ export const normalizeWs = (value: string) => value.replace(/\s+/g, ' ').trim()
 type TextPart = Extract<ChatMessagePart, { type: 'text' }>
 const isTextPart = (part: ChatMessagePart): part is TextPart => part.type === 'text'
 
-/** The same physical row delivered twice is one occurrence; keep its last copy. */
+/** Keep the last delivery of each row-local occurrence, not each equal paragraph. */
 function dedupeRepeatedRowText(parts: ChatMessagePart[]): ChatMessagePart[] {
-  const occurrence = (part: TextPart) => `${part.sourceRowId}:${normalizeWs(part.text)}`
+  const occurrence = (part: TextPart) =>
+    part.sourceCommentaryIndex === undefined
+      ? `${part.sourceRowId}:text:${normalizeWs(part.text)}`
+      : `${part.sourceRowId}:commentary:${part.sourceCommentaryIndex}`
+
   const lastByOccurrence = new Map<string, number>()
 
   parts.forEach((part, index) => {

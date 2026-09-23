@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from contextlib import contextmanager
 
@@ -49,11 +50,11 @@ def _snapshot(db):
                 conn.execute("ROLLBACK")
 
 
-def _display_rows_sql(conn, session_id, *, users_only=False):
+def _display_rows_sql(db, conn, session_id, params, *, users_only=False):
     """Return only representative ids and their stable first-row order, never bodies.
 
-    Legacy stores cannot backfill on a GET. SQL groups their payload identities in
-    SQLite; only user content crosses the Python boundary for carrier normalization.
+    Legacy stores cannot backfill on a GET. Reuse the page/resume grouping, retaining
+    only ids and logical orders from the streaming scan inside the same snapshot.
     Current stores use the durable display index, including protected-tail copies.
     """
     role = " AND role = 'user'" if users_only else ""
@@ -73,25 +74,16 @@ def _display_rows_sql(conn, session_id, *, users_only=False):
             FROM messages m WHERE session_id = :sid AND (active = 1 OR compacted = 1){role}
             GROUP BY m.display_order
         )"""
-    return f"""WITH ranked AS (
-        SELECT id, MIN(id) OVER identity AS sort_id,
-               ROW_NUMBER() OVER (identity ORDER BY active DESC, id DESC) AS preference
-        FROM messages WHERE session_id = :sid AND (active = 1 OR compacted = 1){role}
-        WINDOW identity AS (PARTITION BY role,
-            CASE WHEN role = 'user' THEN timeline_identity_content(content, display_kind) ELSE content END,
-            timestamp, tool_call_id, tool_calls, tool_name)
-    ), display_rows AS (SELECT id AS row_id, sort_id FROM ranked WHERE preference = 1)"""
+    orders = db._legacy_display_orders(
+        conn, session_id, active_clause=db._active_clause(False, True), users_only=users_only)
+    params["display_rows"] = json.dumps(list(orders.items()))
+    return """WITH display_rows AS (
+        SELECT json_extract(value, '$[0]') AS row_id, json_extract(value, '$[1]') AS sort_id
+        FROM json_each(:display_rows)
+    )"""
 
 
 def _register_functions(db, conn):
-    from agent.context_compressor import split_user_originated_turn
-
-    def identity_content(content, display_kind):
-        handoff, live = split_user_originated_turn({
-            "role": "user", "content": db._decode_content(content), "display_kind": display_kind})
-        return db._encode_content(live.get("content")) if handoff is not None and live is not None else content
-
-    conn.create_function("timeline_identity_content", 2, identity_content, deterministic=True)
     conn.create_function("timeline_preview", 3,
                          lambda content, kind, summary: _prompt_preview(db, content, kind, summary),
                          deterministic=True)
@@ -112,8 +104,8 @@ def get_session_messages_around(db, session_id, row_id, *, limit=120):
         ).fetchone()
         if anchor is None or not _prompt_preview(db, *anchor):
             return None
-        sql = _display_rows_sql(conn, session_id)
         params = {"sid": session_id, "row_id": row_id, "limit": limit}
+        sql = _display_rows_sql(db, conn, session_id, params)
         selected = conn.execute(sql + """
             SELECT sort_id FROM display_rows WHERE row_id = :row_id
         """, params).fetchone()
@@ -141,14 +133,14 @@ def get_session_timeline(db, session_id, *, limit=500, after_row_id=0):
     """Chronological prompts. Cursor is the first physical row id of a logical turn."""
     with _snapshot(db) as conn:
         _register_functions(db, conn)
-        sql = _display_rows_sql(conn, session_id, users_only=True) + """,
+        params = {"sid": session_id, "after": after_row_id, "limit": limit + 1}
+        sql = _display_rows_sql(db, conn, session_id, params, users_only=True) + """,
             prompts AS MATERIALIZED (
                 SELECT row_id, sort_id, m.timestamp,
                        timeline_preview(m.content, m.display_kind, m._compressed_summary) AS preview
                 FROM display_rows JOIN messages m ON m.id = row_id
             ), eligible AS MATERIALIZED (SELECT * FROM prompts WHERE preview <> '')
         """
-        params = {"sid": session_id, "after": after_row_id, "limit": limit + 1}
         rows = conn.execute(sql + """
             SELECT row_id, sort_id, timestamp, preview, (SELECT COUNT(*) FROM eligible) AS total
             FROM eligible WHERE sort_id > :after ORDER BY sort_id LIMIT :limit

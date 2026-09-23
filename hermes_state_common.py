@@ -622,13 +622,8 @@ BEGIN
     WHERE session_id = new.session_id AND id <> new.id AND (active = 1 OR compacted = 1)
       AND display_identity = new.display_identity
       AND (new.active = 1 OR new.compacted = 1);
-    UPDATE messages SET display_order = (
-        SELECT MIN(peer.id) FROM messages AS peer
-        WHERE peer.session_id = old.session_id AND (peer.active = 1 OR peer.compacted = 1)
-          AND peer.display_identity = old.display_identity
-    ) WHERE session_id = old.session_id AND (active = 1 OR compacted = 1)
-      AND display_identity = old.display_identity
-      AND NOT (new.active = 1 OR new.compacted = 1);
+    -- Retiring a physical representative does not retire its logical occurrence.
+    -- Surviving peers keep their indexed order, even when its source is rewind-only.
 END;
 DROP TRIGGER IF EXISTS messages_display_identity_update;
 CREATE TRIGGER IF NOT EXISTS messages_display_identity_update

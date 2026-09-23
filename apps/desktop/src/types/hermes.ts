@@ -627,6 +627,9 @@ export interface SessionMessage {
   content: unknown
   /** Backend-projected user-visible content when a physical row also carries internal model scaffolding. */
   display_content?: unknown
+  /** Profile-authorized, sanitized public commentary; never inferred from raw sidecars. */
+  display_commentary?: string[]
+
   context?: unknown
   name?: string
   reasoning?: null | string
@@ -658,6 +661,8 @@ export interface SessionMessage {
    */
   row_id?: number
   id?: number
+  /** Logical occurrence retained when compaction replaces the physical row. */
+  display_order?: number
   text?: unknown
   timestamp?: number
   tool_call_id?: null | string

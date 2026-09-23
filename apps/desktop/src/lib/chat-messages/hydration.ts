@@ -4,6 +4,7 @@ import { extractImageRefs } from '@/lib/embedded-images'
 import { dedupeGeneratedImageEchoesInParts } from '@/lib/generated-images'
 import type { MessageReaction, SessionMessage } from '@/types/hermes'
 
+import { sourceRowOccurrence, storedSourceRow } from './occurrence-identity'
 import { assistantTextPart, chatMessageText, dedupeRepeatedTextInParts, reasoningPart, textPart } from './parts'
 import {
   applyStoredToolResult,
@@ -13,7 +14,7 @@ import {
   toolPartFromStoredCall,
   withUniqueToolCallIds
 } from './tool-parts'
-import type { ChatMessage, ChatMessagePart } from './types'
+import type { ChatMessage, ChatMessagePart, TranscriptSourceRow } from './types'
 
 const ATTACHED_CONTEXT_MARKER_RE = /(?:^|\n)--- Attached Context ---\s*\n/
 const CONTEXT_WARNINGS_MARKER_RE = /(?:^|\n)--- Context Warnings ---[\s\S]*$/
@@ -27,9 +28,8 @@ const DISCORD_TRIGGERING_NOTE_RE =
 
 /**
  * Reply text from a Responses-API `codex_message_items` sidecar (#68321), for rows
- * whose `content` persisted empty. `commentary` / `analysis` items are mid-turn
- * narration the backend routes to the reasoning channel
- * (codex_responses_adapter `_OutputScan._message`); the remaining phases are the reply.
+ * whose `content` persisted empty. Analysis stays private; public commentary
+ * requires the backend's profile-authorized display projection, not raw items.
  */
 function codexMessageItemText(message: SessionMessage): string {
   let items = message.codex_message_items
@@ -246,19 +246,20 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
   // rows into one message, and the store's older-page offset is counted in
   // backend rows, so the folded message has to report how many it covers
   // (see ChatMessage.serverRowSpan).
-  let pendingToolRows = 0
+  let pendingToolRows: TranscriptSourceRow[] = []
   let activeAssistantIndex: null | number = null
 
   const clearPendingTools = () => {
     pendingToolParts = []
     pendingToolTimestamp = undefined
-    pendingToolRows = 0
+    pendingToolRows = []
   }
 
-  /** Attribute `rows` backend rows to a folded message (absent field means one). */
-  const absorbRows = (message: ChatMessage | undefined, rows: number) => {
-    if (message && rows > 0) {
-      message.serverRowSpan = (message.serverRowSpan ?? 1) + rows
+  /** Keep provenance even for rows whose visible parts are later deduplicated. */
+  const absorbRows = (message: ChatMessage | undefined, rows: TranscriptSourceRow[]) => {
+    if (message && rows.length > 0) {
+      message.serverRows = [...message.serverRows!, ...rows]
+      message.serverRowSpan = message.serverRows.length
     }
   }
 
@@ -295,12 +296,20 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     }
 
     if (!appendPartsToActiveAssistant(pendingToolParts, pendingToolTimestamp)) {
+      const firstRow = pendingToolRows[0]
+      const occurrence = sourceRowOccurrence(firstRow)
+
       result.push({
-        id: `${pendingToolTimestamp || Date.now()}-${index}-tools`,
+        id:
+          occurrence !== undefined
+            ? `stored-${occurrence}-assistant`
+            : `${pendingToolTimestamp || Date.now()}-${index}-tools`,
+        ...firstRow,
         role: 'assistant',
         parts: pendingToolParts,
         durableComplete: false,
-        ...(pendingToolRows > 1 ? { serverRowSpan: pendingToolRows } : {}),
+        serverRows: pendingToolRows,
+        ...(pendingToolRows.length > 1 ? { serverRowSpan: pendingToolRows.length } : {}),
         timestamp: pendingToolTimestamp
       })
       activeAssistantIndex = result.length - 1
@@ -310,12 +319,14 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
   }
 
   messages.forEach((message, index) => {
+    const sourceRow = storedSourceRow(message)
+
     if (message.role === 'tool') {
       const updatedPendingToolParts = applyStoredToolResultToParts(pendingToolParts, message)
 
       if (updatedPendingToolParts) {
         pendingToolParts = updatedPendingToolParts
-        pendingToolRows += 1
+        pendingToolRows.push(sourceRow)
 
         return
       }
@@ -326,7 +337,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
 
       pendingToolParts = [...pendingToolParts, storedToolMessagePart(message, index)]
       pendingToolTimestamp ??= message.timestamp
-      pendingToolRows += 1
+      pendingToolRows.push(sourceRow)
 
       return
     }
@@ -362,7 +373,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     const extractedAttachmentRefs = imageRefExtraction?.refs.length ? imageRefExtraction.refs : undefined
 
     const parts: ChatMessagePart[] = []
-    const rowId = message.row_id ?? (typeof message.id === 'number' ? message.id : undefined)
+    const { rowId, displayOrder } = sourceRow
     const sourceHasTools = Array.isArray(message.tool_calls) && message.tool_calls.length > 0
     const durableComplete = sourceHasTools ? false : rowId !== undefined ? true : undefined
 
@@ -375,6 +386,14 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       parts.push(reasoningPart(reasoning, message.timestamp))
     }
 
+    if (displayRole === 'assistant' && message.display_kind !== 'hidden' && Array.isArray(message.display_commentary)) {
+      for (const [sourceCommentaryIndex, text] of message.display_commentary.entries()) {
+        if (typeof text === 'string' && text.trim()) {
+          parts.push({ ...assistantTextPart(text, message.timestamp), sourceCommentaryIndex })
+        }
+      }
+    }
+
     if (displayContent) {
       parts.push(
         displayRole === 'assistant'
@@ -385,7 +404,12 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
 
     // Reply text can live only in the sidecar alongside reasoning or tool parts.
     // Those parts are not a substitute for the answer; canonical content still wins.
-    if (message.role === 'assistant' && message.display_kind !== 'hidden' && !displayContent) {
+    if (
+      message.role === 'assistant' &&
+      message.display_kind !== 'hidden' &&
+      message.display_content === undefined &&
+      !displayContent
+    ) {
       const codexText = codexMessageItemText(message)
 
       if (codexText) {
@@ -401,11 +425,13 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       )
     }
 
-    if (rowId !== undefined) {
-      for (const part of parts) {
-        if (part.type === 'text') {
-          part.sourceRowId = rowId
-        }
+    for (const part of parts) {
+      if (rowId !== undefined) {
+        part.sourceRowId = rowId
+      }
+
+      if (displayOrder !== undefined) {
+        part.sourceDisplayOrder = displayOrder
       }
     }
 
@@ -424,12 +450,12 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     if (isToolOnlyAssistant) {
       pendingToolParts = [...pendingToolParts, ...parts]
       pendingToolTimestamp ??= message.timestamp
-      pendingToolRows += 1
+      pendingToolRows.push(sourceRow)
 
       return
     }
 
-    let pendingAbsorbedRows = 0
+    let pendingAbsorbedRows: TranscriptSourceRow[] = []
 
     if (message.role === 'assistant') {
       if (pendingToolParts.length) {
@@ -457,7 +483,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
           message.timestamp,
           ...parts.map(part => part.timestamp)
         )
-        absorbRows(activeAssistant, 1)
+        absorbRows(activeAssistant, [sourceRow])
 
         return
       }
@@ -469,8 +495,14 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     // Gateway resume names the durable row id `row_id`; the REST transcript
     // prefetch ships the same messages.id as a numeric `id`. Either one lets
     // reactions address this exact row later.
+    const firstRow = pendingAbsorbedRows[0] ?? sourceRow
+    const occurrence = sourceRowOccurrence(firstRow)
+
     result.push({
-      id: `${message.timestamp || Date.now()}-${index}-${displayRole}`,
+      id:
+        occurrence !== undefined
+          ? `stored-${occurrence}-${displayRole}`
+          : `${message.timestamp || Date.now()}-${index}-${displayRole}`,
       role: displayRole,
       parts,
       ...(message.role === 'assistant' && durableComplete !== undefined ? { durableComplete } : {}),
@@ -479,8 +511,9 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
         : {}),
       ...(message.display_kind === 'process_complete' ? { asyncResultKind: 'process' as const } : {}),
       timestamp: earliestTimestamp(message.timestamp, ...parts.map(part => part.timestamp)),
-      ...(rowId !== undefined ? { rowId } : {}),
-      ...(pendingAbsorbedRows > 0 ? { serverRowSpan: pendingAbsorbedRows + 1 } : {}),
+      ...firstRow,
+      serverRows: [...pendingAbsorbedRows, sourceRow],
+      ...(pendingAbsorbedRows.length > 0 ? { serverRowSpan: pendingAbsorbedRows.length + 1 } : {}),
       ...(reactions.length ? { reactions } : {}),
       ...(extractedAttachmentRefs ? { attachmentRefs: extractedAttachmentRefs } : {})
     })

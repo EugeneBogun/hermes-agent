@@ -74,6 +74,7 @@ def test_submit_ack_binds_the_written_row_even_if_worker_consumes_staging(monkey
                 "session_id": sid, "text": "same prompt"}})["result"])
         rows = db.get_messages_as_conversation(key, include_row_ids=True)
         assert [reply.get("user_row_id") for reply in replies] == [row["_row_id"] for row in rows]
+        assert [reply.get("user_display_order") for reply in replies] == [row["_display_order"] for row in rows]
         assert replies[0]["user_row_id"] != replies[1]["user_row_id"]
     finally:
         server._sessions.pop(sid, None)
@@ -130,10 +131,27 @@ def test_completion_receipt_covers_only_committed_current_turn_rows(monkeypatch,
         rows = db.get_messages_as_conversation(key, include_row_ids=True)
         assert payload.get("persisted_turn") == {
             "user_row_id": rows[-2]["_row_id"],
+            "user_display_order": rows[-2]["_display_order"],
             "row_ids": [row["_row_id"] for row in rows[-2:]],
             "final_assistant_row_id": rows[-1]["_row_id"],
+            "final_assistant_display_order": rows[-1]["_display_order"],
             "complete": True,
         }
+        # Real compaction selects newer physical rows, but the acknowledged display identity survives.
+        db.archive_and_compact(key, [dict(message) for message in messages])
+        clones = db.get_messages_as_conversation(key, include_row_ids=True)
+        st.result["messages"] = clones
+        cloned_payload, _, _ = server._complete_turn_payload(session, st, None, 80)
+        assert cloned_payload["persisted_turn"] == {
+            "user_row_id": clones[-2]["_row_id"],
+            "user_display_order": rows[-2]["_display_order"],
+            "row_ids": [row["_row_id"] for row in clones[-2:]],
+            "final_assistant_row_id": clones[-1]["_row_id"],
+            "final_assistant_display_order": rows[-1]["_display_order"],
+            "complete": False,
+        }
+        assert clones[-1]["_row_id"] != rows[-1]["_row_id"]
+        st.result["messages"] = messages
         # Compression can discard an already-streamed segment even while the old prefix survives.
         agent.context_compressor = SimpleNamespace(compression_count=1)
         compressed, _, _ = server._complete_turn_payload(session, st, None, 80)
@@ -143,6 +161,12 @@ def test_completion_receipt_covers_only_committed_current_turn_rows(monkeypatch,
         current[-1]["content"] = "not flushed"
         partial, _, _ = server._complete_turn_payload(session, st, None, 80)
         assert partial["persisted_turn"] == {
+            "user_row_id": rows[-2]["_row_id"], "user_display_order": rows[-2]["_display_order"],
+            "row_ids": [rows[-2]["_row_id"]], "complete": False}
+        # Legacy/unindexed metadata is additive: still acknowledge proven physical writes.
+        db._write_sql("UPDATE messages SET display_order = NULL, display_identity = NULL")
+        legacy, _, _ = server._complete_turn_payload(session, st, None, 80)
+        assert legacy["persisted_turn"] == {
             "user_row_id": rows[-2]["_row_id"], "row_ids": [rows[-2]["_row_id"]], "complete": False}
         # No authoritative current-turn anchor: never infer from matching text or positions in old history.
         agent._persist_user_message_idx = None

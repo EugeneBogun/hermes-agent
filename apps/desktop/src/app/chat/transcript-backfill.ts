@@ -10,13 +10,14 @@
  * Offsets follow the backend's `order: 'latest'` semantics: measured back
  * from the NEWEST persisted row. Rows persisted after hydration shift that
  * origin, so a fetched page can overlap rows we already hold and even extend
- * past the cached tail. Shared durable rows anchor the merge on either side;
+ * past the cached tail. Shared source occurrences anchor the merge on either side;
  * the offset still advances by the fetched count, which self-corrects the
  * drift on the next page.
  */
 
 import { getOlderSessionMessages } from '@/hermes'
 import { type ChatMessage, toChatMessages } from '@/lib/chat-messages'
+import { sourceRowOccurrence, transcriptOccurrenceIds } from '@/lib/chat-messages/occurrence-identity'
 import { recordTranscriptBackfillPage, type TranscriptProfileScope, transcriptTailState } from '@/store/transcript-tail'
 
 /** Older rows likely exist beyond what the in-memory store holds. */
@@ -25,6 +26,91 @@ export function transcriptBackfillAvailable(
   profile?: TranscriptProfileScope
 ): boolean {
   return Boolean(transcriptTailState(storedSessionId, profile)?.possiblyTruncated)
+}
+
+function rowOccurrences(message: ChatMessage): number[] {
+  const folded =
+    message.serverRows?.flatMap(row => {
+      const id = sourceRowOccurrence(row)
+
+      return id === undefined ? [] : [id]
+    }) ?? []
+
+  return [...folded, ...transcriptOccurrenceIds(message)]
+}
+
+/** A page can begin inside a folded bubble. Keep only the older source rows
+ * before that boundary; the tail owns everything from the shared row onward. */
+function prependFoldedPrefix(older: ChatMessage, tail: ChatMessage): ChatMessage {
+  if (older.role !== 'assistant' || tail.role !== 'assistant' || !older.serverRows) {
+    return tail
+  }
+
+  const covered = new Set(rowOccurrences(tail))
+
+  const boundary = older.serverRows.findIndex(row => {
+    const id = sourceRowOccurrence(row)
+
+    return id !== undefined && covered.has(id)
+  })
+
+  if (boundary <= 0) {
+    return tail
+  }
+
+  const prefixRows = older.serverRows.slice(0, boundary)
+  const prefixIds = new Set(prefixRows.map(sourceRowOccurrence))
+  const consumed = new Set<number>()
+
+  const prefixParts = older.parts
+    .filter(part => {
+      const id = part.sourceDisplayOrder ?? part.sourceRowId
+
+      return id !== undefined && prefixIds.has(id)
+    })
+    .map(part => {
+      if (part.type !== 'tool-call' || !part.toolResultSource) {
+        return part
+      }
+
+      const resultId = sourceRowOccurrence(part.toolResultSource)
+
+      const resultIndex = tail.parts.findIndex(
+        candidate =>
+          candidate.type === 'tool-call' &&
+          resultId !== undefined &&
+          (candidate.sourceDisplayOrder ?? candidate.sourceRowId) === resultId
+      )
+
+      const result = tail.parts[resultIndex]
+
+      if (result?.type !== 'tool-call') {
+        return part
+      }
+
+      // A result-only page has no call arguments/name. Recover those from its
+      // actual call, but let the newer page own the result and physical address.
+      consumed.add(resultIndex)
+
+      return {
+        ...part,
+        result: result.result,
+        completedAt: result.completedAt,
+        isError: result.isError,
+        toolResultMetadata: result.toolResultMetadata,
+        toolResultSource: { rowId: result.sourceRowId, displayOrder: result.sourceDisplayOrder }
+      }
+    })
+
+  const timestamps = [older.timestamp, tail.timestamp].filter((value): value is number => value !== undefined)
+
+  return {
+    ...tail,
+    parts: [...prefixParts, ...tail.parts.filter((_, index) => !consumed.has(index))],
+    timestamp: timestamps.length ? Math.min(...timestamps) : undefined,
+    serverRowSpan: prefixRows.length + (tail.serverRowSpan ?? 1),
+    ...(tail.serverRows ? { serverRows: [...prefixRows, ...tail.serverRows] } : {})
+  }
 }
 
 /**
@@ -43,32 +129,32 @@ export function mergeOlderTranscriptPage(existing: ChatMessage[], olderPage: Cha
     return existing
   }
 
-  const existingRowIndices = new Map<number, number>()
-  const existingIdIndices = new Map<string, number>()
+  const byOccurrence = new Map<string, number>()
+  const byId = new Map<string, number>()
+  const next = [...existing]
+  let changed = false
 
   existing.forEach((message, index) => {
-    if (message.rowId !== undefined) {
-      existingRowIndices.set(message.rowId, index)
+    for (const id of rowOccurrences(message)) {
+      byOccurrence.set(`${message.role}:${id}`, index)
     }
 
-    existingIdIndices.set(message.id, index)
+    byId.set(message.id, index)
   })
 
-  // The offset counts backwards from the newest durable row. While a long
-  // turn persists, an "older" page can overlap the cached tail AND extend
-  // beyond its end. Position fresh rows by the shared anchors, not by the
-  // page's requested direction.
+  // Offset drift can put fresh rows on either side of a shared source.
   const insertions = new Map<number, ChatMessage[]>()
   let pending: ChatMessage[] = []
   let lastAnchor = -1
 
-  for (const message of olderPage) {
+  for (const older of olderPage) {
     const anchor =
-      (message.rowId !== undefined ? existingRowIndices.get(message.rowId) : undefined) ??
-      existingIdIndices.get(message.id)
+      rowOccurrences(older)
+        .map(id => byOccurrence.get(`${older.role}:${id}`))
+        .find(index => index !== undefined) ?? byId.get(older.id)
 
     if (anchor === undefined) {
-      pending.push(message)
+      pending.push(older)
 
       continue
     }
@@ -78,6 +164,9 @@ export function mergeOlderTranscriptPage(existing: ChatMessage[], olderPage: Cha
       pending = []
     }
 
+    const merged = prependFoldedPrefix(older, next[anchor])
+    changed ||= merged !== next[anchor]
+    next[anchor] = merged
     lastAnchor = anchor
   }
 
@@ -86,7 +175,7 @@ export function mergeOlderTranscriptPage(existing: ChatMessage[], olderPage: Cha
     insertions.set(position, [...(insertions.get(position) ?? []), ...pending])
   }
 
-  if (insertions.size === 0) {
+  if (insertions.size === 0 && !changed) {
     return existing
   }
 
@@ -100,7 +189,7 @@ export function mergeOlderTranscriptPage(existing: ChatMessage[], olderPage: Cha
     }
 
     if (index < existing.length) {
-      merged.push(existing[index])
+      merged.push(next[index])
     }
   }
 
@@ -113,7 +202,7 @@ export function mergeOlderTranscriptPage(existing: ChatMessage[], olderPage: Cha
  * newest page; replacing the store with that page outright would silently
  * drop everything "Show earlier" already loaded. Find where the refreshed
  * tail begins inside the previous transcript and keep the older prefix.
- * When no anchor is found (compaction rewrite, different session), the
+ * When no anchor is found (removed history or a different session), the
  * refreshed tail is authoritative — same behavior as before backfill existed.
  */
 export function graftRefreshedTailOntoBackfill(refreshedTail: ChatMessage[], previous: ChatMessage[]): ChatMessage[] {
@@ -123,17 +212,18 @@ export function graftRefreshedTailOntoBackfill(refreshedTail: ChatMessage[], pre
 
   const first = refreshedTail[0]
 
+  const firstIds = new Set(rowOccurrences(first))
+
   const anchor = previous.findIndex(
     message =>
-      (first.rowId !== undefined && message.rowId !== undefined && message.rowId === first.rowId) ||
-      message.id === first.id
+      message.role === first.role && (rowOccurrences(message).some(id => firstIds.has(id)) || message.id === first.id)
   )
 
-  if (anchor <= 0) {
+  if (anchor < 0) {
     return refreshedTail
   }
 
-  return [...previous.slice(0, anchor), ...refreshedTail]
+  return mergeOlderTranscriptPage(refreshedTail, previous.slice(0, anchor + 1))
 }
 
 export interface BackfillRequest {

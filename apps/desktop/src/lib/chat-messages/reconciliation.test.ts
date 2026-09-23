@@ -89,6 +89,30 @@ it('reconciles only the represented failed tail, retaining its structured error 
 
 const turnLabels = (messages: ChatMessage[]) => messages.map(message => `${message.role}:${chatMessageText(message)}`)
 
+it('does not absorb an identity-bearing failed run into an equal-text gap from another occurrence', () => {
+  const before = row('before', 'user', 'Earlier', { rowId: 1 })
+  const after = row('after', 'user', 'Later', { rowId: 5 })
+
+  const stored = [
+    before,
+    row('stored-prompt', 'user', 'Inspect', { rowId: 2 }),
+    row('stored-reply', 'assistant', 'Partial', { rowId: 3 }),
+    after
+  ]
+
+  const failedPrompt = row('failed-prompt', 'user', 'Inspect', { rowId: 12 })
+  const failed = row('failed-reply', 'assistant', 'Partial', { rowId: 13, error: 'Lost connection' })
+  const merged = preserveLocalAssistantErrors(stored, [before, failedPrompt, failed, after])
+  expect(merged.map(message => message.id)).toEqual([
+    before.id,
+    failedPrompt.id,
+    failed.id,
+    'stored-prompt',
+    'stored-reply',
+    after.id
+  ])
+})
+
 it('drops a local errored turn the refreshed transcript already stored under new ids', () => {
   const stored = [
     row('s1', 'user', 'old q', { rowId: 1 }),
@@ -167,4 +191,34 @@ it('keeps a failed tail at the end while its re-submitted prompt is still local-
   )
 
   expect(merged.map(message => message.id)).toEqual(['u1', 'a1', 'u0', 'local-failure'])
+})
+
+it('reattaches a failed occurrence by durable identity after page shifts and compaction', () => {
+  const failed = row('assistant-stream-failed', 'assistant', 'Partial response', {
+    rowId: 22,
+    displayOrder: 12,
+    error: 'Connection lost',
+    errorSurface: { code: 'transport_lost', layer: 'streaming', retryable: true }
+  })
+
+  const local = [
+    row('user-attachment', 'user', 'Inspect', { rowId: 21, displayOrder: 11, attachmentRefs: ['@file:notes.md'] }),
+    failed
+  ]
+
+  const stored = toChatMessages([
+    { id: 1, display_order: 1, role: 'user', content: 'Older prompt' },
+    { id: 2, display_order: 2, role: 'assistant', content: 'Partial response' },
+    { id: 121, display_order: 11, role: 'user', content: 'Inspect\n\n--- Attached Context ---\nnotes' },
+    { id: 122, display_order: 12, role: 'assistant', content: 'Partial response' },
+    { id: 123, display_order: 13, role: 'user', content: 'Next prompt' },
+    { id: 124, display_order: 14, role: 'assistant', content: 'Partial response' }
+  ])
+
+  const merged = preserveLocalAssistantErrors(stored, local)
+  expect(merged.map(message => message.id)).toEqual(stored.map(message => message.id))
+  expect(merged.filter(message => message.error)).toMatchObject([
+    { rowId: 122, displayOrder: 12, error: failed.error, errorSurface: failed.errorSurface }
+  ])
+  expect(preserveLocalAssistantErrors(merged, local)).toEqual(merged)
 })

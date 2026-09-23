@@ -36,6 +36,7 @@ import { $todosBySession, setSessionTodos } from '@/store/todos'
 import type { ClientSessionState } from '../../../types'
 
 import { collapseDuplicateFinalAfterToolInterim, type DuplicateFinalCollapse } from './collapse-duplicate-final'
+import { canSettleCompletion, completionOccurrenceIndex, ownCompletionMessage } from './completion-identity'
 import { useGatewayEventHandler } from './gateway-event'
 import { handleServerRequest as dispatchServerRequest } from './gateway-event/server-requests'
 import { currentResponseParts, mergeCurrentResponseText } from './response-parts'
@@ -161,6 +162,7 @@ export function useMessageStream({
             ...state,
             messages: nextMessages,
             streamId,
+            completionTurn: ownCompletionMessage(state, streamId),
             sawAssistantPayload: true,
             awaitingResponse: false
           }
@@ -539,7 +541,7 @@ export function useMessageStream({
           return state
         }
 
-        const streamId = state.streamId
+        const streamId = state.streamId ?? nextStreamMessageId('assistant-interim')
 
         const replaceTextPart = (parts: ChatMessagePart[]) => {
           const visibleText = stripGeneratedImageEchoes(authoritativeText, generatedImageEchoSources(parts)).trim()
@@ -577,7 +579,7 @@ export function useMessageStream({
           nextMessages = [
             ...nextMessages,
             {
-              id: nextStreamMessageId('assistant-interim'),
+              id: streamId,
               role: 'assistant' as const,
               parts: [{ ...assistantTextPart(authoritativeText, occurredAt), completedAt: occurredAt }],
               timestamp: occurredAt,
@@ -593,6 +595,7 @@ export function useMessageStream({
           ...state,
           messages: nextMessages,
           streamId: null,
+          completionTurn: ownCompletionMessage(state, streamId),
           interimBoundaryPending: true,
           sawAssistantPayload: state.sawAssistantPayload || Boolean(authoritativeText)
         }
@@ -625,6 +628,7 @@ export function useMessageStream({
             needsInput: false,
             pendingBranchGroup: null,
             streamId: null,
+            completionTurn: undefined,
             turnStartedAt: null,
             turnLive: false
           }
@@ -659,6 +663,7 @@ export function useMessageStream({
 
         const withPersistedIdentity = (message: ChatMessage): ChatMessage => {
           const finalRowId = persistedTurn?.final_assistant_row_id
+          const finalDisplayOrder = persistedTurn?.final_assistant_display_order ?? undefined
           const hasFinalRow = typeof finalRowId === 'number' && Number.isSafeInteger(finalRowId) && finalRowId > 0
           const finalPartIndex = message.parts.findLastIndex(part => part.type === 'text')
 
@@ -671,8 +676,11 @@ export function useMessageStream({
             ...(hasFinalRow
               ? {
                   rowId: message.rowId ?? finalRowId,
+                  displayOrder: message.displayOrder ?? (message.rowId === undefined ? finalDisplayOrder : undefined),
                   parts: message.parts.map((part, index) =>
-                    index === finalPartIndex ? { ...part, sourceRowId: finalRowId } : part
+                    index === finalPartIndex
+                      ? { ...part, sourceRowId: finalRowId, sourceDisplayOrder: finalDisplayOrder }
+                      : part
                   )
                 }
               : {})
@@ -739,28 +747,44 @@ export function useMessageStream({
         )
 
         const streamIndex = streamId
-          ? prev.findIndex((message, index) => index > lastUserIndex && message.id === streamId)
+          ? prev.findIndex(
+              (message, index) =>
+                index > lastUserIndex && message.id === streamId && canSettleCompletion(message, persistedTurn)
+            )
           : -1
 
         const settleAt = (index: number) =>
           prev.map((message, messageIndex) => (messageIndex === index ? completeMessage(message) : message))
 
         let collapsed: DuplicateFinalCollapse | null = null
+        const receiptIndex = completionOccurrenceIndex(prev, persistedTurn)
 
-        if (streamIndex >= 0) {
+        if (receiptIndex >= 0) {
+          nextMessages = settleAt(receiptIndex)
+        } else if (streamIndex >= 0) {
           collapsed = collapseDuplicateFinalAfterToolInterim(prev, streamIndex, {
             completeMessage,
             finalText,
             hasFailure: Boolean(failure) || Boolean(completionError),
             interimBoundaryPending
           })
+
+          // Collapse can choose the adjacent interim instead of the stream;
+          // that target must pass the same receipt-identity gate.
+          if (
+            collapsed &&
+            prev.some(message => message.id === collapsed?.keptId && !canSettleCompletion(message, persistedTurn))
+          ) {
+            collapsed = null
+          }
+
           nextMessages = collapsed?.messages ?? settleAt(streamIndex)
         } else {
           const fallbackIndex = prev.findLastIndex(
             (message, index) => index > lastUserIndex && message.role === 'assistant' && !message.hidden
           )
 
-          if (fallbackIndex >= 0) {
+          if (fallbackIndex >= 0 && canSettleCompletion(prev[fallbackIndex], persistedTurn)) {
             const index = fallbackIndex
             const existing = prev[index]
 
@@ -828,7 +852,11 @@ export function useMessageStream({
 
             const sealed = sealedIndex >= 0 ? prev[sealedIndex] : null
 
-            if (sealed?.interim === true && chatMessageText(sealed).trim() === finalText) {
+            if (
+              sealed?.interim === true &&
+              canSettleCompletion(sealed, persistedTurn) &&
+              chatMessageText(sealed).trim() === finalText
+            ) {
               nextMessages = settleAt(sealedIndex)
             } else if (finalText) {
               nextMessages = [...prev, newAssistantFromCompletion()]
@@ -884,6 +912,7 @@ export function useMessageStream({
           messages: nextMessages,
           adoptedRunningTurn: false,
           streamId: null,
+          completionTurn: undefined,
           pendingBranchGroup: null,
           awaitingResponse: false,
           busy: false,
@@ -975,6 +1004,7 @@ export function useMessageStream({
           ...state,
           messages: nextMessages,
           streamId: null,
+          completionTurn: undefined,
           pendingBranchGroup: null,
           sawAssistantPayload: true,
           awaitingResponse: false,

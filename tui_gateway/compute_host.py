@@ -457,7 +457,8 @@ class ComputeHost:
         else:
             output = server._mirror_slash_side_effects(sid, session, command) if command else ""
             with session["history_lock"]:
-                messages = server._history_to_messages(list(session.get("history") or []))
+                messages = server._history_to_messages(
+                    list(session.get("history") or []), profile_home=session.get("profile_home") or server._hermes_home)
                 ack = {"output": output, **_history_meta(session), "messages": messages}
         ack["session_info"] = server._session_info(session.get("agent"), session)
         return ack

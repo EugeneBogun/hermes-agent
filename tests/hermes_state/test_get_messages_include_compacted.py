@@ -100,9 +100,9 @@ class TestIncludeCompacted:
     def test_include_inactive_compacted_paging_keeps_rewound_rows(self, tmp_path, read_only, latest, limit, offset):
         path = tmp_path / "audit.db"
         db = _seed(SessionDB(path))
-        expected = db.get_messages("s1", include_inactive=True)
         db._execute_write(lambda conn: conn.execute(
             "UPDATE messages SET display_order = NULL, display_identity = NULL"))
+        expected = db.get_messages("s1", include_inactive=True)
         if read_only:
             db.close()
             db = SessionDB(path, read_only=True)
@@ -381,8 +381,9 @@ class TestDisplayDedupe:
         assert [message["id"] for message in messages] == [carrier_id, later_id]
         assert messages[0]["content"] == carrier
         assert original_id not in [message["id"] for message in messages]
-        # Index columns never escape the message dict (BLOB identity is not JSON-serializable).
-        assert not {"display_identity", "display_order"} & set(messages[0])
+        # Only the numerical logical identity is public; the binary hash remains internal.
+        assert "display_identity" not in messages[0]
+        assert messages[0].get("display_order") == (None if read_only else original_id)
         json.dumps(messages)
         # SQLite stores -0.0 and 0.0 as one value; the hashed identity must agree with that.
         db.append_message(sid, role="assistant", content="same", timestamp=-0.0)

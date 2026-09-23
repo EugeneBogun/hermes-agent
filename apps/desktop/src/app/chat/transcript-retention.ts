@@ -114,10 +114,10 @@ export function boundRetainedTranscript(
     return NOTHING_RELEASED
   }
 
-  // Nothing in flight may be released: a `pending` row has no backend row yet,
-  // so it cannot be fetched back and dropping it would lose content outright.
+  // Settled journal/local output can still lack a refetchable backend row.
+  // Neither it nor in-flight content may be dropped or counted as stored rows.
   for (let i = 0; i < boundary; i += 1) {
-    if (messages[i].pending) {
+    if (messages[i].pending || messages[i].rowId === undefined) {
       return NOTHING_RELEASED
     }
   }

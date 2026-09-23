@@ -96,7 +96,8 @@ def test_broken_yaml_serves_last_good_and_fail_closed_raises(homes):
         load_user_config_effective(home / "config.yaml", fail_closed=True)
 
 
-def test_good_backup_is_written_only_for_the_active_home(homes, tmp_path):
+@pytest.mark.parametrize("display_read_first", [False, True])
+def test_good_backup_is_written_only_for_the_active_home(homes, tmp_path, display_read_first):
     """Reading ANOTHER profile's config (doctor, TUI cwd lookup) is a read: it must not create
     ``backups/config/`` inside that profile. The active home keeps the last-good copy."""
     from hermes_cli.config_effective import load_user_config_effective
@@ -107,6 +108,9 @@ def test_good_backup_is_written_only_for_the_active_home(homes, tmp_path):
     _write(home / "config.yaml", USER_YAML)
     _write(other / "config.yaml", USER_YAML)
 
+    if display_read_first:
+        load_user_config_effective(home / "config.yaml", persist_backup=False)
+        assert not (home / "backups").exists()
     load_user_config_effective(other / "config.yaml")
     load_user_config_effective(home / "config.yaml")
 

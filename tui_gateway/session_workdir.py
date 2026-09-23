@@ -370,6 +370,13 @@ def _persist_submit_user_row(session: dict, text: Any, display_kind: str | None)
         except Exception as exc:
             _workdir_reraise_disk_full(exc, "submit-time user row persist failed")
             return
+        try:
+            display_order = db.get_message_display_orders(key, [staged["_row_id"]]).get(staged["_row_id"])
+            if display_order is not None:
+                staged["_display_order"] = display_order
+        except Exception:
+            # Metadata read failure must not discard an already committed submit row.
+            logger.debug("submit-time display identity unavailable", exc_info=True)
     staged[_DB_PERSISTED_MARKER] = True
     session["_submit_user_row"] = staged
 

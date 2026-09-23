@@ -1531,13 +1531,12 @@ def _assistant_reasoning_text(agent, assistant_message) -> Optional[str]:
             reasoning_text = "\n\n".join(b.strip() for b in think_blocks if b.strip()) or None
     if reasoning_text and agent.verbose_logging:
         logging.debug(f"Captured reasoning ({len(reasoning_text)} chars): {reasoning_text}")
-    # When streaming is active the reasoning was already displayed during the
-    # stream (structured deltas or <think> tag extraction); fire only for
-    # non-streaming modes (gateway, batch, quiet). Anything not shown during
-    # streaming is caught by the CLI post-response fallback.
-    if reasoning_text and agent.reasoning_callback and not agent.stream_delta_callback and not agent._stream_callback:
+    # Installed text callbacks do not prove streaming happened (disabled streams,
+    # provider fallback, or reasoning only present on the completed response).
+    if reasoning_text and agent.reasoning_callback and not getattr(agent, "_response_reasoning_delivered", False):
         with contextlib.suppress(Exception):
             agent.reasoning_callback(reasoning_text)
+            agent._response_reasoning_delivered = True
     return _sanitize_surrogates(reasoning_text) if reasoning_text else reasoning_text
 
 

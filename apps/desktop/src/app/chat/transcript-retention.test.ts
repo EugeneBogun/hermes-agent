@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
-import type { ChatMessage } from '@/lib/chat-messages'
+import { type ChatMessage, toChatMessages } from '@/lib/chat-messages'
+import { mergeInFlightMessages } from '@/lib/inflight-turn-journal'
 import { messageStoreWeight, RENDER_WEIGHT_CHARS } from '@/lib/render-weight'
 
 import { boundRetainedTranscript, TRANSCRIPT_RETAIN_BUDGET } from './transcript-retention'
@@ -90,6 +91,50 @@ describe('boundRetainedTranscript', () => {
     )
 
     expect(untouched(messages, messages[40].id)).toEqual({ released: false })
+  })
+
+  it('retains unaddressable journal suffixes until history can refetch their exact rows', () => {
+    const rows = [
+      { id: 1, display_order: 1, role: 'user' as const, content: 'Inspect' },
+      {
+        id: 2,
+        display_order: 2,
+        role: 'assistant' as const,
+        content: 'Checking.',
+        tool_calls: [{ id: 'call-a', function: { name: 'read_file', arguments: '{}' } }]
+      },
+      { id: 3, display_order: 3, role: 'assistant' as const, content: 'Recovered final' }
+    ]
+
+    const base = toChatMessages(rows.slice(0, 2))
+
+    const journal = [
+      base[0],
+      {
+        ...base[1],
+        parts: [...base[1].parts, { type: 'text' as const, text: rows[2].content }]
+      }
+    ]
+
+    const recovered = mergeInFlightMessages(base, journal)
+    expect(recovered.messages.at(-1)).toMatchObject({ recovered: true, pending: false })
+    expect(recovered.messages.at(-1)?.rowId).toBeUndefined()
+
+    const slack = {
+      ...row(20),
+      parts: Array.from({ length: TRANSCRIPT_RETAIN_BUDGET }, () => ({ type: 'text' as const, text: '.' }))
+    }
+
+    const anchor = row(21)
+    expect(boundRetainedTranscript([...recovered.messages, slack, anchor], anchor.id).released).toBe(false)
+
+    // When the final has a real source row, recovery reanchors the suffix;
+    // retention can release it and rewind precisely the represented rows.
+    const addressable = mergeInFlightMessages(base, toChatMessages(rows))
+    expect(addressable.messages.at(-1)).toMatchObject({ rowId: rows[2].id, serverRowSpan: 1 })
+    const retention = released([...addressable.messages, slack, anchor], anchor.id)
+    expect(retention.messages).toEqual([slack, anchor])
+    expect(retention.releasedServerRows).toBe(rows.length)
   })
 
   it('does not split an assistant branch group', () => {

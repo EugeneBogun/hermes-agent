@@ -2454,6 +2454,7 @@ export interface PromptSubmitResult {
   status?: PromptSubmitStatus | null
   voice_stopped?: boolean | null
   user_row_id?: number | null
+  user_display_order?: number | null
   survivor_user_row_ids?: (number | null)[] | null
   survivor_row_id_map?: Record<string, number | null> | null
   turn_isolation?: boolean | null
@@ -2794,6 +2795,8 @@ export interface TranscriptMessage {
   text?: string | null
   timestamp?: number | null
   row_id?: number | null
+  display_order?: number | null
+  display_commentary?: string[] | null
   display_kind?: string | null
   display_metadata?: unknown | null
   name?: string | null
@@ -4366,6 +4369,8 @@ export interface PersistedTurn {
   complete: boolean
   user_row_id?: number | null
   final_assistant_row_id?: number | null
+  user_display_order?: number | null
+  final_assistant_display_order?: number | null
 }
 /** ``server._status_update`` and the direct emitters (goal / loop / heartbeat / process). */
 export interface StatusUpdatePayload {

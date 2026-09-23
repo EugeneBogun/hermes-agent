@@ -5,6 +5,12 @@ import {
   normalizeWs as normalizedText
 } from '@/lib/chat-messages'
 import { withoutCoveredAssistantPrefix } from '@/lib/chat-messages/coverage'
+import {
+  conflictingTranscriptIdentity,
+  sameTranscriptOccurrence,
+  transcriptOccurrenceIds
+} from '@/lib/chat-messages/occurrence-identity'
+import type { TranscriptSourceRow } from '@/lib/chat-messages/types'
 import { isLiveTailReplyId } from '@/lib/spoken-reply'
 
 /**
@@ -37,6 +43,8 @@ const MAX_ENTRIES = Math.min(24, Math.floor(MAX_SESSION_STORE_CHARS / MAX_ENTRY_
 const MAX_LEGACY_STORE_CHARS = 2 * 1024 * 1024
 const MAX_SESSION_KEY_CHARS = 512
 const MAX_JOURNALED_MESSAGES = 24
+// Never truncate provenance: an incomplete ledger would corrupt retention offsets.
+const MAX_JOURNALED_SOURCE_ROWS = 2048
 const MAX_TEXT_PART_CHARS = 64 * 1024
 const MAX_METADATA_CHARS = 2 * 1024
 const MAX_USER_ATTACHMENT_REFS = 256
@@ -126,6 +134,19 @@ function writeRaw(store: Storage, key: string, value: string): boolean {
   }
 }
 
+function isSourceRow(value: unknown): value is TranscriptSourceRow {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false
+  }
+
+  const row = value as TranscriptSourceRow
+
+  return (
+    (row.rowId === undefined || Number.isSafeInteger(row.rowId)) &&
+    (row.displayOrder === undefined || Number.isSafeInteger(row.displayOrder))
+  )
+}
+
 function isSnapshot(value: unknown): value is InFlightTurnSnapshot {
   if (!value || typeof value !== 'object') {
     return false
@@ -149,6 +170,11 @@ function isSnapshot(value: unknown): value is InFlightTurnSnapshot {
             typeof part.type === 'string' &&
             (part.sourceRowId === undefined ||
               (typeof part.sourceRowId === 'number' && Number.isFinite(part.sourceRowId))) &&
+            (part.sourceDisplayOrder === undefined ||
+              (typeof part.sourceDisplayOrder === 'number' && Number.isSafeInteger(part.sourceDisplayOrder))) &&
+            (part.sourceCommentaryIndex === undefined ||
+              (Number.isSafeInteger(part.sourceCommentaryIndex) && part.sourceCommentaryIndex >= 0)) &&
+            (part.toolResultSource === undefined || isSourceRow(part.toolResultSource)) &&
             (part.type !== 'text' && part.type !== 'reasoning'
               ? part.type !== 'tool-call' ||
                 (typeof part.toolName === 'string' &&
@@ -167,7 +193,16 @@ function isSnapshot(value: unknown): value is InFlightTurnSnapshot {
         (message.durableComplete === undefined || typeof message.durableComplete === 'boolean') &&
         (message.attachmentRefs === undefined ||
           (Array.isArray(message.attachmentRefs) && message.attachmentRefs.every(ref => typeof ref === 'string'))) &&
-        (message.rowId === undefined || (typeof message.rowId === 'number' && Number.isFinite(message.rowId)))
+        (message.rowId === undefined || (typeof message.rowId === 'number' && Number.isFinite(message.rowId))) &&
+        (message.displayOrder === undefined ||
+          (typeof message.displayOrder === 'number' && Number.isSafeInteger(message.displayOrder))) &&
+        (message.serverRowSpan === undefined ||
+          (Number.isSafeInteger(message.serverRowSpan) && message.serverRowSpan > 0)) &&
+        (message.serverRows === undefined ||
+          (Array.isArray(message.serverRows) &&
+            message.serverRows.length <= MAX_JOURNALED_SOURCE_ROWS &&
+            message.serverRows.length === (message.serverRowSpan ?? 1) &&
+            message.serverRows.every(isSourceRow)))
     ) &&
     (snapshot.streamId === null || typeof snapshot.streamId === 'string') &&
     (snapshot.turnStartedAt === null || typeof snapshot.turnStartedAt === 'number') &&
@@ -277,17 +312,24 @@ function boundedString(value: string, maxChars: number): string {
 }
 
 function boundedPart(part: ChatMessagePart): ChatMessagePart | null {
+  const source = {
+    ...(part.sourceRowId === undefined ? {} : { sourceRowId: part.sourceRowId }),
+    ...(part.sourceDisplayOrder === undefined ? {} : { sourceDisplayOrder: part.sourceDisplayOrder }),
+    ...(part.sourceCommentaryIndex === undefined ? {} : { sourceCommentaryIndex: part.sourceCommentaryIndex })
+  }
+
   if (part.type === 'text') {
     return {
+      ...source,
       type: 'text',
       text: boundedString(part.text, MAX_TEXT_PART_CHARS),
-      ...(part.sourceRowId === undefined ? {} : { sourceRowId: part.sourceRowId }),
       ...(part.parentId === undefined ? {} : { parentId: boundedString(part.parentId, MAX_METADATA_CHARS) })
     }
   }
 
   if (part.type === 'reasoning') {
     return {
+      ...source,
       type: 'reasoning',
       text: boundedString(part.text, MAX_TEXT_PART_CHARS),
       ...(part.parentId === undefined ? {} : { parentId: boundedString(part.parentId, MAX_METADATA_CHARS) })
@@ -299,9 +341,15 @@ function boundedPart(part: ChatMessagePart): ChatMessagePart | null {
     // needs invocation identity and failure state; args/results are available
     // from the backend transcript when it survives.
     return {
+      ...source,
       type: 'tool-call',
       toolName: boundedString(part.toolName, MAX_METADATA_CHARS),
       args: {},
+      ...(part.toolResultSource === undefined
+        ? {}
+        : {
+            toolResultSource: { rowId: part.toolResultSource.rowId, displayOrder: part.toolResultSource.displayOrder }
+          }),
       ...(part.toolCallId === undefined ? {} : { toolCallId: boundedString(part.toolCallId, MAX_METADATA_CHARS) }),
       ...(part.result === undefined ? {} : { result: {} }),
       ...(part.isError === undefined ? {} : { isError: part.isError })
@@ -324,6 +372,10 @@ function boundedMessages(messages: ChatMessage[]): ChatMessage[] | null {
   // prompts skip journaling instead of weakening the match.
   if (
     bounded.some(message => {
+      if (message.serverRows && message.serverRows.length > MAX_JOURNALED_SOURCE_ROWS) {
+        return true
+      }
+
       if (message.role !== 'user') {
         return false
       }
@@ -386,7 +438,14 @@ function boundedMessages(messages: ChatMessage[]): ChatMessage[] | null {
                   .slice(0, MAX_USER_ATTACHMENT_REFS)
                   .map(ref => boundedString(ref, MAX_METADATA_CHARS))
         }),
-    ...(message.rowId === undefined ? {} : { rowId: message.rowId })
+    ...(message.rowId === undefined ? {} : { rowId: message.rowId }),
+    ...(message.displayOrder === undefined ? {} : { displayOrder: message.displayOrder }),
+    ...(message.serverRowSpan === undefined ? {} : { serverRowSpan: message.serverRowSpan }),
+    ...(message.serverRows === undefined
+      ? {}
+      : {
+          serverRows: message.serverRows.map(row => ({ rowId: row.rowId, displayOrder: row.displayOrder }))
+        })
   }))
 }
 
@@ -538,9 +597,10 @@ function userMessagesMatch(left: ChatMessage, right: ChatMessage): boolean {
   return (
     left.role === 'user' &&
     right.role === 'user' &&
-    (left.rowId === undefined || right.rowId === undefined || left.rowId === right.rowId) &&
-    normalizedText(chatMessageText(left)) === normalizedText(chatMessageText(right)) &&
-    attachmentSignature(left) === attachmentSignature(right)
+    !conflictingTranscriptIdentity(left, right) &&
+    (sameTranscriptOccurrence(left, right) ||
+      (normalizedText(chatMessageText(left)) === normalizedText(chatMessageText(right)) &&
+        attachmentSignature(left) === attachmentSignature(right)))
   )
 }
 
@@ -722,7 +782,10 @@ function journalTailAlreadyCommitted(tailAssistants: ChatMessage[], baseMessages
   const lastTurnStart = baseMessages.findLastIndex(message => message.role === 'user')
 
   const identityCovers = (base: ChatMessage, index: number, journaled: ChatMessage) =>
-    base.id === journaled.id || (journaled.rowId === undefined ? index > lastTurnStart : base.rowId === journaled.rowId)
+    base.id === journaled.id ||
+    (transcriptOccurrenceIds(journaled).length === 0
+      ? index > lastTurnStart
+      : sameTranscriptOccurrence(base, journaled))
 
   return recoverable.every(message =>
     baseMessages.some(

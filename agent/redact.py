@@ -93,7 +93,12 @@ _SENSITIVE_QUERY_PARAMS = frozenset({
 # to this env var in hermes_cli/main.py, gateway/run.py, and cli.py) or `HERMES_REDACT_SECRETS=false` in
 # ~/.hermes/.env. An opt-out warning is logged at gateway and CLI startup so operators see the downgrade —
 # see `_log_redaction_status()` in gateway/run.py and cli.py.
-_REDACT_ENABLED = os.getenv("HERMES_REDACT_SECRETS", "true").lower() in {"1", "true", "yes", "on"}
+_REDACTION_BOOL_VALUES = {
+    "1": True, "true": True, "yes": True, "on": True,
+    "0": False, "false": False, "no": False, "off": False,
+}
+_REDACT_ENABLED = _REDACTION_BOOL_VALUES.get(
+    os.getenv("HERMES_REDACT_SECRETS", "true").strip().lower(), True)
 
 # Routed multiplex profiles: the import-time snapshot above is the LAUNCH profile's policy. A profile
 # served under a HERMES_HOME override resolves its own ``security.redact_secrets`` (its ``.env``
@@ -123,11 +128,15 @@ def _redact_enabled() -> bool:
             from hermes_cli.config import load_env
             raw = load_env().get("HERMES_REDACT_SECRETS")
         if raw is None:
-            from hermes_cli.config import load_config_readonly
-            cfg_val = (load_config_readonly().get("security") or {}).get("redact_secrets")
+            from hermes_cli.config_effective import load_user_config_effective
+            cfg_val = (load_user_config_effective(
+                fail_closed=True, persist_backup=False).get("security") or {}).get("redact_secrets")
             raw = None if cfg_val is None else str(cfg_val)
         if raw is not None:
-            enabled = str(raw).strip().lower() in {"1", "true", "yes", "on"}
+            enabled = _REDACTION_BOOL_VALUES.get(str(raw).strip().lower())
+            if enabled is None:
+                # Invalid/unresolved policy is not an opt-out or a cacheable decision.
+                return True
     except Exception:
         enabled = True  # unreadable policy: keep the secure default
     with _REDACT_ENABLED_LOCK:

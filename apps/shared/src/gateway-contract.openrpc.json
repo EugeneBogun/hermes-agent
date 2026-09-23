@@ -19345,6 +19345,30 @@
             ],
             "default": null,
             "title": "Final Assistant Row Id"
+          },
+          "user_display_order": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "User Display Order"
+          },
+          "final_assistant_display_order": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Final Assistant Display Order"
           }
         },
         "required": [
@@ -25408,6 +25432,18 @@
             ],
             "default": null,
             "title": "User Row Id"
+          },
+          "user_display_order": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "User Display Order"
           },
           "survivor_user_row_ids": {
             "anyOf": [
@@ -34713,6 +34749,33 @@
             ],
             "default": null,
             "title": "Row Id"
+          },
+          "display_order": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Display Order"
+          },
+          "display_commentary": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Display Commentary"
           },
           "display_kind": {
             "anyOf": [

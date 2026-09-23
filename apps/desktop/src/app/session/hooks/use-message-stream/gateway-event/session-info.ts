@@ -29,6 +29,7 @@ import {
 import { reportInstallMethodWarning } from '@/store/updates'
 
 import { finalizeInterruptedMessages } from '../../use-prompt-actions/rewind'
+import { acceptedCompletionTurn } from '../completion-identity'
 import {
   applySessionInfoStatePatch,
   hasSessionInfoStatePatch,
@@ -287,7 +288,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
         state => {
           const busy = Boolean(payload!.running)
 
-          if (state.busy === busy && (busy || !state.awaitingResponse)) {
+          if (state.busy === busy && (busy ? state.turnLive : !state.awaitingResponse)) {
             return state
           }
 
@@ -311,6 +312,9 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
             return {
               ...state,
               busy,
+              // Only a newly adopted turn replaces ownership. Heartbeats of
+              // the same live turn must keep its sealed/queued output owned.
+              completionTurn: state.turnLive ? state.completionTurn : acceptedCompletionTurn(state.messages),
               // running=true from the backend is turn-live proof, same as
               // message.start (e.g. resuming an already-running session
               // that never replays its start event).
@@ -377,6 +381,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
             messages: finalizeInterruptedMessages(state.messages, state.streamId, occurredAt),
             pendingBranchGroup: null,
             streamId: null,
+            completionTurn: undefined,
             turnStartedAt: null,
             turnLive: false
           }

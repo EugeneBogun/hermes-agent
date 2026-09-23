@@ -192,7 +192,9 @@ _HISTORY_ASSISTANT_DETAIL_KEYS = (
 _HISTORY_ROLES = frozenset({"user", "assistant", "tool", "system"})
 
 
-def _history_to_messages(history: list[dict]) -> list[dict]:
+def _history_to_messages(history: list[dict], *, profile_home=None) -> list[dict]:
+    from agent.history_commentary import project_history_commentary
+
     messages = []
     tool_call_args = {}
     for m in history:
@@ -245,6 +247,8 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         # Durable row identity (_rows_to_conversation); reactions etc. address persisted messages by it.
         if m.get("_row_id") is not None:
             msg["row_id"] = m["_row_id"]
+        if type(m.get("_display_order")) is int and m["_display_order"] > 0:
+            msg["display_order"] = m["_display_order"]
         # A user turn shows its skill invocation, never the expanded body (rewind re-sends by ordinal).
         invocation = _skill_scaffold_projection(content_text) if role == "user" else ""
         if invocation:
@@ -258,7 +262,7 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if m.get("display_metadata"):
             msg["display_metadata"] = m["display_metadata"]
         messages.append(msg)
-    return messages
+    return project_history_commentary(messages, home=profile_home)
 
 
 def _coerce_seed_history(value: Any) -> list[dict]:

@@ -1,7 +1,15 @@
+import { sourceRowOccurrence } from './occurrence-identity'
 import { normalizeWs as normalizedText } from './parts'
 import type { ChatMessage, ChatMessagePart } from './types'
 
 function sameOccurrencePart(stored: ChatMessagePart, local: ChatMessagePart): boolean {
+  const storedId = stored.sourceDisplayOrder ?? stored.sourceRowId
+  const localId = local.sourceDisplayOrder ?? local.sourceRowId
+
+  if (storedId !== undefined && localId !== undefined && storedId !== localId) {
+    return false
+  }
+
   if (stored.type === 'tool-call' && local.type === 'tool-call') {
     return Boolean(stored.toolCallId) && stored.toolCallId === local.toolCallId
   }
@@ -11,6 +19,49 @@ function sameOccurrencePart(stored: ChatMessagePart, local: ChatMessagePart): bo
   }
 
   return false
+}
+
+function assistantSuffix(message: ChatMessage, consumed: number): ChatMessage {
+  const parts = message.parts.slice(consumed)
+  const firstId = parts[0].sourceDisplayOrder ?? parts[0].sourceRowId
+  const rowIndex = message.serverRows?.findIndex(row => sourceRowOccurrence(row) === firstId) ?? -1
+
+  const sharesSource = message.parts
+    .slice(0, consumed)
+    .some(part => (part.sourceDisplayOrder ?? part.sourceRowId) === firstId)
+
+  if (firstId !== undefined && rowIndex >= 0 && !sharesSource) {
+    const serverRows = message.serverRows!.slice(rowIndex)
+    const first = serverRows[0]
+
+    return {
+      ...message,
+      id: `stored-${firstId}-assistant`,
+      rowId: first.rowId,
+      displayOrder: first.displayOrder,
+      parts,
+      serverRows,
+      serverRowSpan: serverRows.length,
+      timestamp: parts[0].timestamp,
+      reactions: undefined
+    }
+  }
+
+  // A legacy or partially written source has no independently addressable
+  // suffix. Preserve it as local output, never as the covered row again:
+  // retention must not release bytes it cannot refetch or count guessed spans.
+  return {
+    ...message,
+    id: `assistant-stream-recovered-${message.id}-${consumed}`,
+    parts,
+    rowId: undefined,
+    displayOrder: undefined,
+    serverRows: undefined,
+    serverRowSpan: undefined,
+    reactions: undefined,
+    durableComplete: false,
+    persistedTurn: undefined
+  }
 }
 
 /** Subtract an ordered, tool-anchored prefix within an already matched user
@@ -45,7 +96,7 @@ export function withoutCoveredAssistantPrefix(stored: ChatMessage[], local: Chat
 
     if (consumed < message.parts.length) {
       stopped = true
-      remaining.push(consumed ? { ...message, parts: message.parts.slice(consumed) } : message)
+      remaining.push(consumed ? assistantSuffix(message, consumed) : message)
     }
   }
 

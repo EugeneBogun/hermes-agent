@@ -3,6 +3,7 @@ import type { BillingBlock } from '@hermes/shared'
 import { burstVibeHearts } from '@/components/chat/vibe-hearts'
 import { reportFirstBuildTurnComplete } from '@/components/onboarding-chat/first-build'
 import { translateNow } from '@/i18n'
+import { completeOpenTimelineParts } from '@/lib/chat-messages'
 import { coerceGatewayText, coerceThinkingText } from '@/lib/chat-runtime'
 import { playCompletionSound } from '@/lib/completion-sound'
 import { parseErrorSurface } from '@/lib/error-surface'
@@ -18,6 +19,8 @@ import { setCurrentUsage, setTurnStartedAt } from '@/store/session'
 import { refreshSupportedSessionControlAfterTurn } from '@/store/session-control'
 import { pruneFinishedSessionSubagents } from '@/store/subagents'
 import { clearActiveSessionTodos } from '@/store/todos'
+
+import { acceptedCompletionTurn, isPastCompletion } from '../completion-identity'
 
 import type { GatewayEventContext } from './types'
 
@@ -124,6 +127,17 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
 
       return {
         ...state,
+        // A lost terminal frame must not let this turn overwrite the old
+        // streaming bubble. The accepted start is a new occurrence.
+        completionTurn: acceptedCompletionTurn(state.messages),
+        messages: state.streamId
+          ? state.messages.map(message =>
+              message.id === state.streamId
+                ? { ...message, pending: false, parts: completeOpenTimelineParts(message.parts, occurredAt) }
+                : message
+            )
+          : state.messages,
+        streamId: null,
         busy: true,
         awaitingResponse: true,
         sawAssistantPayload: false,
@@ -315,6 +329,12 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
 
   if (event.type === 'message.complete') {
     if (!sessionId) {
+      return true
+    }
+
+    // A replay can follow newer history hydration. Resolve its receipt before
+    // clearing another turn's prompts, notifying, or choosing a tail bubble.
+    if (isPastCompletion(sessionStateByRuntimeIdRef.current.get(sessionId), payload?.persisted_turn)) {
       return true
     }
 

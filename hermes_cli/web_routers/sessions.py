@@ -11,6 +11,7 @@ import json
 import re
 import sqlite3
 import time
+from pathlib import Path
 from typing import Callable, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -551,9 +552,10 @@ def _with_tool_call_labels(message: dict) -> dict:
     return {**message, "tool_call_labels": labels} if labels else message
 
 
-def _project_for_display(messages: list) -> list:
+def _project_for_display(messages: list, *, home=None) -> list:
     from agent.compaction_display import project_compaction_message_for_display
     from agent.context_compressor import is_compaction_summary_message
+    from agent.history_commentary import project_history_commentary
 
     projected_messages = []
     for message in messages:
@@ -573,7 +575,7 @@ def _project_for_display(messages: list) -> list:
             projected["display_content"] = display_view.get("content")
             projected.pop("display_kind", None)
         projected_messages.append(projected)
-    return projected_messages
+    return project_history_commentary(projected_messages, home=home)
 
 
 @manage_router.get("/api/sessions/{session_id}/messages")
@@ -594,15 +596,15 @@ async def get_session_messages(
         default_page = limit is None
         latest_page = order == "latest" or (order is None and default_page)
         _limit = 500 if default_page else min(limit, 500)
-        return sid, _limit, db.get_messages(
+        messages = db.get_messages(
             sid, limit=_limit, offset=offset, latest=latest_page,
             include_compacted=include_compacted)
+        return sid, _limit, _project_for_display(messages, home=Path(db.db_path).parent)
 
     result = await asyncio.to_thread(_with_db, profile, _read, read_only=True)
     if result is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
-    sid, _limit, messages = result
-    projected_messages = _project_for_display(messages)
+    sid, _limit, projected_messages = result
     return {
         "session_id": sid,
         # The same stamp list rows carry, so the Desktop keys a page under the
@@ -667,11 +669,10 @@ async def get_session_messages_around(
         page = read_around(db, sid, row_id, limit=limit)
         if page is None:
             raise HTTPException(status_code=404, detail="Prompt not found")
+        page["messages"] = _project_for_display(page["messages"], home=Path(db.db_path).parent)
         return {"session_id": sid, "profile": owner, **page}
 
-    result = await asyncio.to_thread(_with_db, profile, _read, read_only=True)
-    result["messages"] = _project_for_display(result["messages"])
-    return result
+    return await asyncio.to_thread(_with_db, profile, _read, read_only=True)
 
 
 @manage_router.delete("/api/sessions/{session_id}")

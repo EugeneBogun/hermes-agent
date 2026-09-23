@@ -1,3 +1,4 @@
+import { conflictingTranscriptIdentity, sameTranscriptOccurrence, transcriptOccurrenceIds } from './occurrence-identity'
 import { chatMessageText } from './parts'
 import type { ChatMessage, ChatMessagePart } from './types'
 
@@ -19,7 +20,11 @@ const latestBoundary = (...values: (number | undefined)[]) => {
 const normalizedTimelineText = (message: ChatMessage) => chatMessageText(message).replace(/\s+/g, ' ').trim()
 
 const assistantTimelineMatch = (stored: ChatMessage, local: ChatMessage) => {
-  if (stored.id === local.id) {
+  if (conflictingTranscriptIdentity(stored, local)) {
+    return false
+  }
+
+  if (stored.id === local.id || sameTranscriptOccurrence(stored, local)) {
     return true
   }
 
@@ -88,7 +93,7 @@ const tailTurnAssistantMatchIndex = (
     localAssistants.length !== storedAssistants.length ||
     !storedAssistants.every((stored, index) => {
       const local = localAssistants[index]
-      const sameRow = stored.rowId === undefined || local.rowId === undefined || stored.rowId === local.rowId
+      const sameRow = !conflictingTranscriptIdentity(stored, local)
 
       return sameRow && assistantTimelineMatch(stored, local)
     })
@@ -189,15 +194,40 @@ export function preserveLocalAssistantErrors(
 ): ChatMessage[] {
   nextMessages = reconcileLocalAssistantTimeline(nextMessages, currentMessages)
   const localById = new Map(currentMessages.map(message => [message.id, message]))
+  const failedByOccurrence = new Map<number, ChatMessage>()
+  const representedLocalIds = new Set<string>()
+
+  for (const message of currentMessages) {
+    if (message.role === 'assistant' && message.error && !message.hidden) {
+      for (const id of transcriptOccurrenceIds(message)) {
+        failedByOccurrence.set(id, message)
+      }
+    }
+  }
 
   const mergedNextMessages = nextMessages.map(message => {
-    if (message.role !== 'assistant' || message.error || message.hidden) {
+    if (message.role !== 'assistant' || message.hidden) {
       return message
     }
 
-    const local = localById.get(message.id)
+    const local =
+      transcriptOccurrenceIds(message)
+        .map(id => failedByOccurrence.get(id))
+        .find(Boolean) ?? localById.get(message.id)
 
-    if (!local || local.role !== 'assistant' || !local.error || local.hidden) {
+    if (
+      !local ||
+      local.role !== 'assistant' ||
+      !local.error ||
+      local.hidden ||
+      conflictingTranscriptIdentity(message, local)
+    ) {
+      return message
+    }
+
+    representedLocalIds.add(local.id)
+
+    if (message.error) {
       return message
     }
 
@@ -209,7 +239,7 @@ export function preserveLocalAssistantErrors(
     }
   })
 
-  const existingIds = new Set(mergedNextMessages.map(message => message.id))
+  const existingIds = new Set([...mergedNextMessages.map(message => message.id), ...representedLocalIds])
   const preserveIds = new Set<string>()
   const normalize = (value: string) => value.replace(/\s+/g, ' ').trim()
   const tailUserInNext = [...mergedNextMessages].reverse().find(message => message.role === 'user' && !message.hidden)
@@ -250,7 +280,12 @@ export function preserveLocalAssistantErrors(
         continue
       }
 
-      if (candidate.role === 'user' && !existingIds.has(candidate.id) && !matchesTailUserInNext(candidate)) {
+      if (
+        candidate.role === 'user' &&
+        !existingIds.has(candidate.id) &&
+        !mergedNextMessages.some(stored => sameTranscriptOccurrence(candidate, stored)) &&
+        !matchesTailUserInNext(candidate)
+      ) {
         preserveIds.add(candidate.id)
       }
 
@@ -273,12 +308,16 @@ export function preserveLocalAssistantErrors(
   for (const message of currentMessages) {
     const open = runs.at(-1)?.after === anchor ? runs.at(-1) : undefined
 
-    if (existingIds.has(message.id)) {
+    const stored = mergedNextMessages.find(
+      candidate => candidate.id === message.id || sameTranscriptOccurrence(candidate, message)
+    )
+
+    if (stored) {
       if (open) {
-        open.before = message.id
+        open.before = stored.id
       }
 
-      anchor = message.id
+      anchor = stored.id
     } else if (preserveIds.has(message.id)) {
       const kept = { ...message, pending: false }
 
@@ -296,7 +335,12 @@ export function preserveLocalAssistantErrors(
   for (const { after, before, rows } of runs) {
     const gap = before === undefined ? [] : mergedNextMessages.slice(indexOf(after) + 1, indexOf(before))
 
-    if (gap.length && gap.map(label).join('\n') === rows.map(label).join('\n')) {
+    if (
+      gap.length === rows.length &&
+      gap.every(
+        (stored, index) => !conflictingTranscriptIdentity(stored, rows[index]) && label(stored) === label(rows[index])
+      )
+    ) {
       continue
     }
 

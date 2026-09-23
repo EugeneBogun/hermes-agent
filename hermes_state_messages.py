@@ -508,12 +508,31 @@ class SessionMessagesMixin:
         row = self._read_one("SELECT role FROM messages WHERE id = ? AND session_id = ? AND active = 1", (int(row_id), session_id))
         return row[0] if row else None
 
-    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
+    def get_message_display_orders(self, session_id: str, row_ids: List[int]) -> Dict[int, int]:
+        """Logical display identities for exact physical addresses, scoped to their owning session.
+
+        Used for turn acknowledgements (user/final assistant), not transcript discovery. Missing
+        legacy metadata stays unproven; never replace it with a content match or the physical id.
+        """
+        ids = list(dict.fromkeys(rid for rid in row_ids if type(rid) is int and rid > 0))
+        if not session_id or not ids:
+            return {}
+        with self._read_ctx() as conn:
+            if "display_order" not in self._message_column_names(conn):
+                return {}
+            rows = conn.execute(
+                f"SELECT id, display_order FROM messages WHERE session_id = ? AND id IN ({_placeholders(ids)})",
+                (session_id, *ids)).fetchall()
+        return {row["id"]: row["display_order"] for row in rows
+                if type(row["display_order"]) is int and row["display_order"] > 0}
+
+    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]],
+                             *, display_orders: Optional[Dict[int, int]] = None) -> tuple[int, int]:
         """Insert *messages* as fresh active rows in the caller's txn -> ``(inserted, tool_call_count)``.
         Never touches sessions.* counters (callers reconcile differently); reasoning kept for assistant rows."""
         now_ts = time.time()
         inserted = tool_calls_total = 0
-        for msg in messages:
+        for index, msg in enumerate(messages):
             role = msg.get("role", "unknown")
             tool_calls = _parse_tool_calls(msg.get("tool_calls"))
             message_timestamp = _coerce_timestamp(msg.get("timestamp"), now_ts)
@@ -526,6 +545,12 @@ class SessionMessagesMixin:
             msg["timestamp"] = message_timestamp
             if cur.lastrowid is not None:
                 msg["_row_id"] = cur.lastrowid
+                msg.pop("_display_order", None)
+                if display_orders and index in display_orders:
+                    # Captured from this occurrence's live source before it became rewind-only.
+                    conn.execute("UPDATE messages SET display_order = ? WHERE id = ?",
+                                 (display_orders[index], cur.lastrowid))
+                    msg["_display_order"] = display_orders[index]
             inserted += 1
             tool_calls_total += _tool_calls_count(tool_calls)
             now_ts = max(now_ts, message_timestamp) + 1e-6
@@ -652,13 +677,11 @@ class SessionMessagesMixin:
         return [int(r["id"]) for r in rows], sum(_tool_calls_len(r["tool_calls"]) for r in rows)
 
     def _clone_message_rows(self, conn, tail_ids: List[int], *, session_id: Optional[str] = None) -> None:
-        """Pure-SQL clone of *tail_ids* as fresh live rows (new id/display order, active=1, compacted=0;
-        message payload columns stay byte-exact and FTS triggers index the clones), into *session_id* when given."""
+        """Pure-SQL clone with new physical ids and byte-exact payloads; FTS indexes the clones.
+        In-place copies keep occurrence order even after the source becomes rewind-only. A rotation
+        into another session retains the destination's existing display-generation policy."""
         retarget = session_id is not None
-        # A clone is a newly positioned display generation. Copy its indexed
-        # identity, but let the insert trigger assign order from rows that are
-        # still display-visible (the source may just have become rewind-only).
-        skip = ("id", "active", "compacted", "display_order") + (("session_id",) if retarget else ())
+        skip = ("id", "active", "compacted") + (("session_id", "display_order") if retarget else ())
         col_list = ", ".join(c for c in self._message_column_names(conn) if c not in skip)
         conn.execute(
             f"INSERT INTO messages ({col_list}, {'session_id, ' if retarget else ''}active, compacted) "
@@ -728,6 +751,45 @@ class SessionMessagesMixin:
                 resolved.append(matches[0])
         return list(dict.fromkeys(resolved))
 
+    def _carried_display_orders(self, conn, session_id: str, messages: List[Dict[str, Any]],
+                                protected_ids: List[int]) -> Dict[int, int]:
+        """Capture occurrence lineage BEFORE visibility triggers retire the sources.
+
+        Row addresses select sources; the protected suffix's positional contract covers callers
+        without addresses. Payload equality only validates that selected row, never searches for
+        an occurrence. In particular, no hidden/foreign row or caller-supplied display_order is trusted.
+        """
+        sources = {index: msg["_row_id"] for index, msg in enumerate(messages)
+                   if type(msg.get("_row_id")) is int and msg["_row_id"] > 0}
+        for index, row_id in zip(range(len(messages) - 1, -1, -1), protected_ids):
+            # A new, not-yet-durable turn may also be in the compressor's suffix. With neither
+            # address nor durable timestamp, even identical text does not prove it is this row.
+            if "_row_id" not in messages[index] and messages[index].get("timestamp") is not None:
+                sources[index] = row_id
+        if not sources:
+            return {}
+        ids = list(set(sources.values()))
+        rows = {row["id"]: row for row in conn.execute(
+            "SELECT id, role, content, tool_call_id, tool_calls, timestamp, display_order FROM messages "
+            f"WHERE session_id = ? AND active = 1 AND id IN ({_placeholders(ids)})",
+            (session_id, *ids))}
+        orders = {}
+        for index, row_id in sources.items():
+            row = rows.get(row_id)
+            if row is None or type(row["display_order"]) is not int or row["display_order"] <= 0:
+                continue
+            msg = messages[index]
+            if self._row_identity(msg.get("role", "unknown"), msg.get("content"), msg.get("tool_call_id"),
+                                  _parse_tool_calls(msg.get("tool_calls"))) != self._row_identity(
+                    row["role"], self._decode_content(row["content"]), row["tool_call_id"],
+                    _parse_tool_calls(row["tool_calls"])):
+                continue
+            if msg.get("timestamp") is not None and coerce_epoch(
+                    msg["timestamp"], field="message timestamp") != row["timestamp"]:
+                continue
+            orders[index] = row["display_order"]
+        return orders
+
     def archive_and_compact(self, session_id: str, compacted_messages: List[Dict[str, Any]],
         model_config_patch: Optional[Dict[str, Any]] = None, watermark: Optional[int] = None,
         lock_holder: Optional[str] = None, tail_count: int = 0,
@@ -743,6 +805,8 @@ class SessionMessagesMixin:
         They are resolved inside this transaction by row id when present, else by unique durable identity +
         timestamp. Those originals and the clones' originals are superseded duplicates and get rewind flags
         (``active=0, compacted=0``) so search doesn't return each carried message once per compaction.
+        Carried rows retain their logical display order via their live row address (or the protected
+        suffix position validated by its durable timestamp), without making rewind-only rows displayable.
         ``model_config_patch`` merges in the same txn (``None`` removes a key).
 
         Concurrent-append safety (#75316): when *watermark* is provided (the value of
@@ -771,12 +835,15 @@ class SessionMessagesMixin:
             # concurrent append would steal a LIMIT slot.
             rewind_ids: list[int] = self._resolve_carried_row_ids(
                 conn, session_id, carried_messages or [])
+            protected_ids = []
             if tail_count > 0:
                 bound = watermark is not None
-                rewind_ids += [int(row["id"]) for row in conn.execute(
+                protected_ids = [int(row["id"]) for row in conn.execute(
                     f"SELECT id FROM messages WHERE session_id = ? AND active = 1{' AND id <= ?' if bound else ''} "
                     "ORDER BY id DESC LIMIT ?",
                     (session_id, *((int(watermark),) if bound else ()), int(tail_count))).fetchall()]
+                rewind_ids += protected_ids
+            display_orders = self._carried_display_orders(conn, session_id, compacted_messages, protected_ids)
             rewind_ids += tail_ids
             rewind_ids = list(dict.fromkeys(rewind_ids))
             if rewind_ids:
@@ -786,7 +853,8 @@ class SessionMessagesMixin:
                 conn.execute(f"{_ARCHIVE_ACTIVE_SQL} AND id NOT IN ({placeholders})", [session_id, *rewind_ids])
             else:
                 conn.execute(_ARCHIVE_ACTIVE_SQL, (session_id,))
-            inserted, tool_calls_total = self._insert_message_rows(conn, session_id, compacted_messages)
+            inserted, tool_calls_total = self._insert_message_rows(
+                conn, session_id, compacted_messages, display_orders=display_orders)
             if tail_ids:
                 self._clone_message_rows(conn, tail_ids)
                 inserted += len(tail_ids)
@@ -881,21 +949,83 @@ class SessionMessagesMixin:
         """Fixed-width durable identity for indexed display-generation lookup."""
         return hashlib.sha256(repr(key).encode("utf-8", "surrogatepass")).digest()
 
-    def _dedupe_display_generations(self, rows):
-        """Collapse compaction generations so each logical message appears once (the protected tail is copied
-        into each generation: same role/content/timestamp, different ``active``/id); prefer the live row, then
-        the newest. The ONE definition every display projection shares. *rows* must be ordered by ``id``."""
-        seen: Dict[Tuple[Any, ...], Any] = {}
-        first_id: Dict[Tuple[Any, ...], int] = {}
+    def _display_generation_orders(self, rows) -> Dict[int, int]:
+        """Map representative ids to logical order, retaining only fingerprints and metadata.
+
+        Within a session, complete indexed order proves occurrence lineage even when loading
+        sanitized a carrier's bytes. Across the selected resume lineage, rotation clones keep
+        their fingerprint but receive destination-local orders. Join those fingerprints only
+        when doing so cannot merge two known occurrences in the SAME session.
+        """
+        groups = {}
+        identities = {}
+        lineages = {}
+        parents = {}
         for row in rows:
-            key = self._display_dedupe_key(row)
-            cur = seen.get(key)
-            if cur is None or (row["active"], row["id"]) > (cur["active"], cur["id"]):
-                seen[key] = row
-            first_id[key] = min(first_id.get(key, row["id"]), row["id"])
-        # Order by the logical message's FIRST row, not the chosen representative's: a protected-tail
-        # copy in a newer generation has a higher id than messages emitted after the original.
-        return [seen[key] for key in sorted(seen, key=first_id.__getitem__)]
+            order, identity = row["display_order"], row["display_identity"]
+            indexed = type(order) is int and order > 0 and identity is not None
+            if identity is None:
+                identity = self._display_identity(self._display_dedupe_key(row))
+            key = (row["session_id"], order if indexed else identity)
+            candidate = (row["active"], row["id"])
+            first, current = groups.get(key, (order if indexed else row["id"], candidate))
+            groups[key] = (first, max(current, candidate))
+            identities.setdefault(identity, set()).add(key)
+            lineages[key] = {row["session_id"]: order} if indexed else {}
+            parents[key] = key
+
+        def root(key):
+            while parents[key] != key:
+                parents[key] = parents[parents[key]]
+                key = parents[key]
+            return key
+
+        changed = True
+        while changed:
+            changed = False
+            for peers in identities.values():
+                remaining = {root(key) for key in peers}
+                while remaining:
+                    # Competing matches form one component. Only a component with no
+                    # conflicting indexed orders proves a join; never pick a pairing
+                    # from an ambiguous component by iteration order.
+                    component = {remaining.pop()}
+                    pending = list(component)
+                    while pending:
+                        current = pending.pop()
+                        compatible = {key for key in remaining if all(
+                            sid not in lineages[key] or lineages[key][sid] == order
+                            for sid, order in lineages[current].items())}
+                        remaining -= compatible
+                        component |= compatible
+                        pending.extend(compatible)
+                    if len(component) < 2:
+                        continue
+                    lineage = {}
+                    ambiguous = False
+                    for key in component:
+                        for sid, order in lineages[key].items():
+                            if lineage.setdefault(sid, order) != order:
+                                ambiguous = True
+                    if ambiguous:
+                        continue
+                    chosen = min(component, key=lambda key: groups[key])
+                    first = min(lineage.values()) if lineage else min(groups[key][0] for key in component)
+                    candidate = max(groups[key][1] for key in component)
+                    for key in component - {chosen}:
+                        parents[key] = chosen
+                        del groups[key]
+                        del lineages[key]
+                    groups[chosen] = (first, candidate)
+                    lineages[chosen] = lineage
+                    # A join can rule out a competing match for an earlier fingerprint.
+                    changed = True
+        # Logical order, not the newer representative's physical address, defines the page.
+        return {candidate[1]: first for first, candidate in sorted(groups.values())}
+
+    def _dedupe_display_generations(self, rows):
+        by_id = {row["id"]: row for row in rows}
+        return [by_id[row_id] for row_id in self._display_generation_orders(rows)]
 
     def _ensure_display_order(self, session_id: str) -> bool:
         """Backfill one legacy session once, preserving the pre-index display identity exactly."""
@@ -912,7 +1042,15 @@ class SessionMessagesMixin:
             missing = conn.execute(_DISPLAY_INDEX_MISSING_SQL, (session_id,)).fetchone()
             if missing is None:
                 return True
-            first_id: Dict[bytes, int] = {}
+            # Valid indexed lineage can point to a now rewind-only source. Backfilling another
+            # group must not replace it with the first currently visible physical clone.
+            first_id = dict(conn.execute(
+                "SELECT display_identity, CASE WHEN MIN(display_order) = MAX(display_order) "
+                "THEN MIN(display_order) END FROM messages "
+                "WHERE session_id = ? AND (active = 1 OR compacted = 1) "
+                "AND display_identity IS NOT NULL AND display_order IS NOT NULL GROUP BY display_identity",
+                (session_id,)))
+            legacy_first = {}
             last_id = 0
             while True:
                 rows = conn.execute(
@@ -926,8 +1064,10 @@ class SessionMessagesMixin:
                 updates = []
                 for row in rows:
                     last_id = row["id"]
+                    if row["display_identity"] is not None and row["display_order"] is not None:
+                        continue
                     identity = self._display_identity(self._display_dedupe_key(row))
-                    order = first_id.setdefault(identity, last_id)
+                    order = first_id.get(identity) or legacy_first.setdefault(identity, last_id)
                     if order != row["display_order"] or identity != row["display_identity"]:
                         updates.append((order, identity, last_id))
                 rows.close()
@@ -939,34 +1079,41 @@ class SessionMessagesMixin:
 
         return bool(self._execute_write(_do))
 
+    def _legacy_display_orders(self, conn, session_id: str, *, active_clause: str,
+                               users_only: bool = False) -> Dict[int, int]:
+        """Share the exact display grouping with legacy pages and timeline/jump reads.
+
+        Stream rows inside the caller's snapshot; only fixed-width identities survive the scan.
+        """
+        columns = self._message_column_names(conn)
+        order_column = "display_order" if "display_order" in columns else "NULL"
+        identity_column = "display_identity" if "display_identity" in columns else "NULL"
+        has_session_index = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+            ("idx_messages_session_id",),
+        ).fetchone() is not None
+        index_hint = "INDEXED BY idx_messages_session_id" if has_session_index else "NOT INDEXED"
+        role = " AND role = 'user'" if users_only else ""
+        rows = conn.execute(
+            "SELECT id, session_id, role, content, timestamp, tool_call_id, tool_calls, tool_name, active, "
+            f"display_kind, display_metadata, {order_column} AS display_order, "
+            f"{identity_column} AS display_identity FROM messages {index_hint} "
+            f"WHERE session_id = ?{active_clause}{role} ORDER BY id ASC",
+            (session_id,))
+        try:
+            return self._display_generation_orders(rows)
+        finally:
+            rows.close()
+
     def _legacy_display_page(self, session_id: str, *, active_clause: str, limit: Optional[int], offset: int,
                              latest: bool) -> List[Any]:
         """Project a legacy read-only display page without retaining transcript payloads."""
-        representatives: Dict[bytes, Tuple[int, int]] = {}
         with self._read_ctx() as conn:
             conn.execute("BEGIN")
             try:
-                has_session_index = conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
-                    ("idx_messages_session_id",),
-                ).fetchone() is not None
-                index_hint = "INDEXED BY idx_messages_session_id" if has_session_index else "NOT INDEXED"
-                rows = conn.execute(
-                    "SELECT id, role, content, timestamp, tool_call_id, tool_calls, tool_name, active, "
-                    f"display_kind, display_metadata FROM messages {index_hint} "
-                    f"WHERE session_id = ?{active_clause} ORDER BY id ASC",
-                    (session_id,))
-                for row in rows:
-                    identity = self._display_identity(self._display_dedupe_key(row))
-                    current = representatives.get(identity)
-                    candidate = (row["active"], row["id"])
-                    if current is None or candidate > current:
-                        representatives[identity] = candidate
-                rows.close()
+                selected_ids = list(self._legacy_display_orders(conn, session_id, active_clause=active_clause))
 
-                identities = list(representatives)
-                identities = identities[::-1][offset:][:limit][::-1] if latest else identities[offset:][:limit]
-                selected_ids = [representatives[identity][1] for identity in identities]
+                selected_ids = selected_ids[::-1][offset:][:limit][::-1] if latest else selected_ids[offset:][:limit]
                 selected = {}
                 for start in range(0, len(selected_ids), 900):
                     chunk = selected_ids[start:start + 900]
@@ -984,7 +1131,10 @@ class SessionMessagesMixin:
         ``_compressed_summary`` only as ``True``."""
         msg = dict(row)
         msg.pop("display_identity", None)
-        msg.pop("display_order", None)
+        # The first-generation display row is a logical identity, not the current
+        # physical address. Legacy stores may not have indexed it yet.
+        if type(msg.get("display_order")) is not int or msg["display_order"] <= 0:
+            msg.pop("display_order", None)
         if summary_flag and msg.pop("_compressed_summary", 0):
             msg["_compressed_summary"] = True
         msg["content"] = self._decode_content(msg["content"])
@@ -1151,8 +1301,13 @@ class SessionMessagesMixin:
     def _fetch_conversation_rows(self, session_ids: List[str], active_clause: str, *, with_session_id: bool):
         """``_CONVERSATION_ROW_COLUMNS`` rows for *session_ids* ORDER BY id (timestamps are not monotonic
         and would break tool-call adjacency)."""
+        with self._read_ctx() as conn:
+            columns = self._message_column_names(conn)
+            display_order = "display_order" if "display_order" in columns else "NULL"
+            display_identity = "display_identity" if "display_identity" in columns else "NULL"
         return self._read_all(
-            f"SELECT {'session_id, ' if with_session_id else ''}{self._CONVERSATION_ROW_COLUMNS} "
+            f"SELECT {'session_id, ' if with_session_id else ''}{self._CONVERSATION_ROW_COLUMNS}, "
+            f"{display_order} AS display_order, {display_identity} AS display_identity "
             f"FROM messages WHERE session_id IN ({_placeholders(session_ids)})"
             f"{active_clause} ORDER BY id", tuple(session_ids))
 
@@ -1167,7 +1322,7 @@ class SessionMessagesMixin:
         cannot merge with an original user turn; the stored transcript is never mutated."""
         rows = self._fetch_conversation_rows(
             self._resume_lineage_ids(session_id) if include_ancestors else [session_id],
-            self._active_clause(include_inactive, include_compacted), with_session_id=False)
+            self._active_clause(include_inactive, include_compacted), with_session_id=include_compacted)
         if include_compacted:
             rows = self._dedupe_display_generations(rows)
         return self._rows_to_conversation(rows, session_id=session_id, include_ancestors=include_ancestors,
@@ -1218,6 +1373,8 @@ class SessionMessagesMixin:
             # the ENTIRE transcript on flush.
             if include_row_ids and row["id"] is not None:
                 msg["_row_id"] = row["id"]
+                if type(row["display_order"]) is int and row["display_order"] > 0:
+                    msg["_display_order"] = row["display_order"]
             msg.update((col, row[col]) for col in ("api_content", "display_kind") if row[col])
             if row["display_metadata"] and (decoded := self._decode_display_metadata(row["display_metadata"])) is not None:
                 msg["display_metadata"] = decoded

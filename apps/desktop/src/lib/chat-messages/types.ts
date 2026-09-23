@@ -5,6 +5,11 @@ import type { ErrorSurface } from '@/lib/error-surface'
 import type { ToolResultMetadata } from '@/lib/tool-result-metadata'
 import type { MessageReaction, SessionMessage, UsageStats } from '@/types/hermes'
 
+export interface TranscriptSourceRow {
+  rowId?: number
+  displayOrder?: number
+}
+
 export interface TimelinePartMetadata {
   toolResultMetadata?: ToolResultMetadata
   /** Unix seconds when this visible activity segment began. Fractional values
@@ -19,6 +24,12 @@ export interface TimelinePartMetadata {
   mediaSource?: string
   /** Durable source occurrence, even when several backend rows share a bubble. */
   sourceRowId?: number
+  /** Logical source occurrence, unchanged when compaction copies the row. */
+  sourceDisplayOrder?: number
+  /** Position in the source row's display_commentary, not a text-derived identity. */
+  sourceCommentaryIndex?: number
+  /** A result row folded into this call; pages may start at the result itself. */
+  toolResultSource?: TranscriptSourceRow
 }
 
 export type ChatMessagePart = Exclude<ThreadMessageLike['content'], string>[number] & TimelinePartMetadata
@@ -58,12 +69,17 @@ export type ChatMessage = {
   attachmentRefs?: string[]
   /** Durable backend `messages.id`. Absent until the row is persisted. */
   rowId?: number
+  /** First-generation row address; stable across compaction rewrites. */
+  displayOrder?: number
   /** Backend transcript rows this message represents — the hydration fold
    *  merges a turn's tool rows into the assistant message they belong to, so a
    *  message is not one backend row. The older-page offset (transcript-tail) is
    *  counted in backend rows, so anything that rewinds that offset must convert
    *  through this. Absent means one row. */
   serverRowSpan?: number
+  /** Ordered provenance for every folded backend row, including consumed tool
+   * results. Unlike parts, this survives display-only text/image deduplication. */
+  serverRows?: TranscriptSourceRow[]
   /** Emoji reactions on this message — one per author (see MessageReaction). */
   reactions?: MessageReaction[]
 }

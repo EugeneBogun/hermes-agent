@@ -117,13 +117,14 @@ it('binds a late submit acknowledgement to its exact optimistic prompt without r
     h.update(state => ({ ...state, messages: [...state.messages, laterUser], needsInput: true }))
     await flush()
 
-    return { status: 'started', user_row_id: 71 } as T
+    return { status: 'started', user_row_id: 71, user_display_order: 11 } as T
   })
 
   await h.submit()
   await flush()
 
   expect(h.state().messages[0].rowId).toBe(71)
+  expect(h.state().messages[0].displayOrder).toBe(11)
   expect($messages.get()[0].rowId).toBe(71)
   expect(h.state().messages.at(-1)).toBe(laterUser)
   expect(h.state()).toMatchObject({ busy: false, awaitingResponse: false, needsInput: true, streamId: null })
@@ -148,7 +149,9 @@ it.each([true, false, undefined])(
         : {
             row_ids: [71, 72, 73],
             user_row_id: 71,
+            user_display_order: 11,
             final_assistant_row_id: 73,
+            final_assistant_display_order: 13,
             complete
           }
 
@@ -157,13 +160,17 @@ it.each([true, false, undefined])(
     const settled = h.state().messages.find(message => message.id === assistantId)!
     expect(settled.pending).toBe(false)
     expect(settled.rowId).toBe(receipt?.final_assistant_row_id)
+    expect(settled.displayOrder).toBe(receipt?.final_assistant_display_order)
+    expect(settled.parts.findLast(part => part.type === 'text')?.sourceDisplayOrder).toBe(
+      receipt?.final_assistant_display_order
+    )
     expect(settled.parts.findLast(part => part.type === 'text')?.sourceRowId).toBe(receipt?.final_assistant_row_id)
     expect(settled.durableComplete === true).toBe(complete === true)
     expect(settled.persistedTurn).toEqual(receipt)
     expect(h.state().messages.at(-1)).toBe(queued)
 
     if (complete === true) {
-      const latestPage = toChatMessages([{ id: 73, role: 'assistant', content: ANSWER }])
+      const latestPage = toChatMessages([{ id: 173, display_order: 13, role: 'assistant', content: ANSWER }])
       h.update(state => ({ ...state, messages: reconcileDurableHistory(latestPage, state.messages) }))
       await flush()
       expect(timeline($messages.get())).toEqual([

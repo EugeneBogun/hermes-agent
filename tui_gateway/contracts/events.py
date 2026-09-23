@@ -178,6 +178,9 @@ class PersistedTurn(Payload):
     complete: bool
     user_row_id: int | None = None
     final_assistant_row_id: int | None = None
+    # Same logical identity as TranscriptMessage.display_order; physical addressing stays above.
+    user_display_order: int | None = None
+    final_assistant_display_order: int | None = None
 
 
 class MessageCompletePayload(Payload):

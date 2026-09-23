@@ -687,6 +687,8 @@ def _(rid, params: dict) -> dict:
     staged_user = session.get("_submit_user_row") or {}
     if isinstance(staged_user.get("_row_id"), int):
         survivor_fields["user_row_id"] = staged_user["_row_id"]
+        if type(staged_user.get("_display_order")) is int and staged_user["_display_order"] > 0:
+            survivor_fields["user_display_order"] = staged_user["_display_order"]
     # A completed FAILED build must not wedge the session: rebuild, don't replay it.
     if not _restart_completed_failed_agent_build(sid, session, session.get("agent_ready")):
         _start_agent_build(sid, session)

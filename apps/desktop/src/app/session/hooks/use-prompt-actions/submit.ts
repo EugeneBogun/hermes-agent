@@ -865,6 +865,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           )
 
           const rowId = submitted.result?.user_row_id
+          const displayOrder = submitted.result?.user_display_order ?? undefined
 
           if (typeof rowId === 'number' && Number.isSafeInteger(rowId) && rowId > 0) {
             // The worker may finish before this acknowledgement arrives. Bind
@@ -873,13 +874,18 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             updateSessionState(submitted.sessionId, state => {
               const index = state.messages.findIndex(message => message.id === optimisticId && message.role === 'user')
 
-              if (index < 0 || state.messages[index].rowId === rowId) {
+              if (
+                index < 0 ||
+                (state.messages[index].rowId === rowId && state.messages[index].displayOrder === displayOrder)
+              ) {
                 return state
               }
 
               return {
                 ...state,
-                messages: state.messages.map((message, i) => (i === index ? { ...message, rowId } : message))
+                messages: state.messages.map((message, i) =>
+                  i === index ? { ...message, rowId, displayOrder } : message
+                )
               }
             })
           }

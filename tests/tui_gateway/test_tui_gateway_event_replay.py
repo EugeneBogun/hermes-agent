@@ -28,7 +28,34 @@ def _frame(sid, etype="message.delta"):
     }
 
 
-def test_stamp_adds_monotonic_seq_per_session():
+def test_session_eviction_never_reuses_identity_or_hides_a_replay_gap(monkeypatch):
+    monkeypatch.setattr(event_replay, "_REPLAY_SESSIONS_MAX", 1)
+    epoch = event_replay.replay_epoch()
+    # The epoch namespace advertises non-reuse to upgraded renderers; older
+    # unversioned epochs must retain their counter-reset compatibility path.
+    assert epoch.startswith("process-seq:")
+    first, missed, other, resumed = [_frame(sid) for sid in ("s1", "s1", "s2", "s1")]
+    event_replay._stamp_event(first)
+    event_replay._stamp_event(missed)
+    cursor = first["params"]["seq"]
+    event_replay._stamp_event(other)
+
+    assert events_since("s1", cursor) == []
+    assert event_replay.is_truncated("s1", cursor)
+    event_replay._stamp_event(resumed)
+
+    # A returning ring must not restart numbering under the same process epoch:
+    # both a reconnect cursor and another socket's delivered identities survive.
+    assert event_replay.replay_epoch() == epoch
+    assert resumed["params"]["seq"] > missed["params"]["seq"]
+    assert events_since("s1", cursor) == [resumed["params"]]
+    assert latest_seq("s1") == resumed["params"]["seq"]
+    assert event_replay.is_truncated("s1", cursor)
+    assert not event_replay.is_truncated("s1", resumed["params"]["seq"])
+    assert replay_stats()["sessions"] == 1
+
+
+def test_stamp_adds_monotonic_seq_without_cross_session_replay():
     f1 = _frame("s1")
     f2 = _frame("s1")
     other = _frame("s2")
@@ -37,9 +64,12 @@ def test_stamp_adds_monotonic_seq_per_session():
     event_replay._stamp_event(other)
     event_replay._stamp_event(f2)
 
-    assert f1["params"]["seq"] == 1
-    assert f2["params"]["seq"] == 2  # per-session counter, unaffected by s2
-    assert other["params"]["seq"] == 1
+    assert f1["params"]["seq"] < other["params"]["seq"] < f2["params"]["seq"]
+    assert events_since("s1", f1["params"]["seq"]) == [f2["params"]]
+    assert events_since("s2", 0) == [other["params"]]
+    # Interleaving creates numeric holes, not missing events for this session.
+    assert not event_replay.is_truncated("s1", f1["params"]["seq"])
+    assert not event_replay.is_truncated("s2", 0)
 
 
 def test_stamp_ignores_non_event_and_sessionless_frames():
@@ -101,13 +131,16 @@ def test_ring_buffer_is_bounded():
 
 
 def test_session_count_bounded_with_fifo_eviction():
-    for i in range(event_replay._REPLAY_SESSIONS_MAX + 10):
-        event_replay._stamp_event(_frame(f"s{i}"))
+    frames = [_frame(f"s{i}") for i in range(event_replay._REPLAY_SESSIONS_MAX + 10)]
+    for frame in frames:
+        event_replay._stamp_event(frame)
 
     stats = replay_stats()
     assert stats["sessions"] == event_replay._REPLAY_SESSIONS_MAX
     assert events_since("s0", 0) == []  # oldest session fully evicted
-    assert latest_seq(f"s{event_replay._REPLAY_SESSIONS_MAX + 9}") == 1
+    assert latest_seq(frames[-1]["params"]["session_id"]) == frames[-1]["params"]["seq"]
+    assert len(event_replay._replay_latest_seq) == stats["sessions"]
+    assert len(event_replay._replay_evicted_through) == stats["sessions"]
 
 
 def test_concurrent_stamping_never_drops_or_duplicates_seq():
@@ -165,7 +198,7 @@ def test_byte_budget_evicts_payloads_and_preserves_gap_semantics(monkeypatch):
     assert stats["bytes"] <= stats["max_bytes_process"]
     assert events_since("s1", 0) == []
     assert event_replay.is_truncated("s1", 0)
-    assert [event["seq"] for event in events_since("s2", 0)] == [1]
+    assert events_since("s2", 0) == [other["params"]]
 
 
 def test_oversized_event_marks_gap_even_with_empty_buffer(monkeypatch):

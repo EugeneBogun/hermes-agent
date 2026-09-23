@@ -18,14 +18,17 @@ import type { GatewayEvent } from '@hermes/shared'
  * share the epoch (a uuid4 minted per backend process, adopted per socket from
  * `gateway.ready`), so the key cannot collide across different backends.
  *
- * A duplicate is a frame with the same key seen within `DUPLICATE_WINDOW_MS`.
- * The window matters: the backend restarts a session's counter at 1 when the
- * session drops out of its 64-session replay ring, so "seq is not above the
- * highest seen" would swallow the whole restart of any session that had fewer
- * events than the restart reaches. Fan-out copies arrive within milliseconds;
- * a legitimately re-numbered frame with the same seq inside the window would
- * need 64 other sessions to emit in between, and is accepted once the window
- * lapses either way.
+ * Process-sequenced identities have no time expiry: a second socket can reconnect
+ * long after another socket delivered its replay. The backend's process-wide
+ * counter never reuses a seq when a session's replay ring is evicted. Keep an
+ * exact bounded set, not a high-water mark: an unseen older frame from a slower
+ * socket still belongs in the transcript. The per-session cap exceeds the
+ * backend's 512-frame replay ring; inactive sessions are evicted LRU.
+ *
+ * `process-seq:` epochs advertise that non-reuse contract. Older backends emit
+ * plain UUID epochs but reuse seqs after ring eviction, so they keep the short
+ * window rather than silently losing legitimate events after an app-only update.
+ * Without any epoch, also scope the fallback to the connection and profile.
  *
  * Events without `seq` or `session_id` (session-less globals, client-local
  * events, legacy backends) always pass — there is no ordering contract to
@@ -48,9 +51,11 @@ export interface GatewayEventDedupe {
 function sessionKey(event: GatewayEvent): string {
   // Before `gateway.ready` a socket has no epoch; bucket by connection so the
   // pair still deduplicates within one backend URL.
-  const epoch = event.replayEpoch ?? `conn:${event.connectionId ?? ''}`
-
-  return `${epoch}\u0000${event.session_id}`
+  return JSON.stringify(
+    event.replayEpoch
+      ? ['epoch', event.replayEpoch, event.session_id]
+      : ['connection', event.connectionId ?? '', event.profile ?? '', event.session_id]
+  )
 }
 
 export function createGatewayEventDedupe(): GatewayEventDedupe {
@@ -91,12 +96,13 @@ export function createGatewayEventDedupe(): GatewayEventDedupe {
 
       const entry = touch(sessionKey(event))
       const firstSeenAt = entry.seen.get(seq)
+      const nonReusingSequence = event.replayEpoch?.startsWith('process-seq:') === true
 
-      if (firstSeenAt !== undefined && now - firstSeenAt < DUPLICATE_WINDOW_MS) {
+      if (firstSeenAt !== undefined && (nonReusingSequence || now - firstSeenAt < DUPLICATE_WINDOW_MS)) {
         return false
       }
 
-      // Re-admitting after the window (counter reset) refreshes the stamp;
+      // Re-admitting a legacy event after the window refreshes the stamp;
       // deleting first keeps insertion order meaningful for the cap below.
       entry.seen.delete(seq)
       entry.seen.set(seq, now)

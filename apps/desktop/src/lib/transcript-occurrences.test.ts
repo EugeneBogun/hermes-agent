@@ -169,3 +169,35 @@ it.each([true, false])('journal replay preserves sealed occurrences (live projec
   expect(assistantTexts(recovered.messages)).toEqual(assistantTexts(base))
   expect(recovered.streamId).toBe(live.id)
 })
+
+it('recognizes a journaled occurrence after more than one compaction generation', () => {
+  const pending = toChatMessages([
+    { id: 101, display_order: 1, role: 'user', content: 'Inspect', timestamp: 1 },
+    { id: 102, display_order: 2, role: 'assistant', content: 'Working', timestamp: 2 }
+  ])
+
+  pending[1] = { ...pending[1], id: 'assistant-stream-current', pending: true, durableComplete: false }
+  const storedSessionId = 'compacted-journal'
+  persistInFlightTurnState({
+    storedSessionId,
+    messages: pending,
+    busy: true,
+    awaitingResponse: false,
+    streamId: pending[1].id,
+    turnStartedAt: 1000
+  })
+  vi.advanceTimersByTime(400)
+  const journal = readInFlightTurnJournal(storedSessionId)!
+  expect(journal.messages.map(message => message.displayOrder)).toEqual([1, 2])
+  expect(journal.messages[1].parts[0].sourceDisplayOrder).toBe(2)
+
+  const completed = toChatMessages([
+    { id: 201, display_order: 1, role: 'user', content: 'Inspect', timestamp: 1 },
+    { id: 202, display_order: 2, role: 'assistant', content: 'Working. Done.', timestamp: 2 }
+  ])
+
+  const recovered = recoverInFlightTurnJournal(storedSessionId, completed)
+  expect(recovered.caughtUp).toBe(true)
+  expect(recovered.messages).toEqual(completed)
+  expect(readInFlightTurnJournal(storedSessionId)).toBeNull()
+})

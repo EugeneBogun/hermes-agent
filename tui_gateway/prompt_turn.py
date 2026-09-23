@@ -800,6 +800,16 @@ def _persisted_turn_receipt(st: _TurnRun, raw: Any, status: str) -> dict | None:
         and len(row_ids) == len(tail)
         and sum(message.get("role") == "user" for message in tail) == 1
         and "final_assistant_row_id" in receipt)
+    anchors = {name: receipt[f"{name}_row_id"] for name in ("user", "final_assistant")
+               if f"{name}_row_id" in receipt}
+    db = getattr(st.agent, "_session_db", None)
+    if db is not None and anchors:
+        try:
+            orders = db.get_message_display_orders(st.agent.session_id, list(anchors.values()))
+            receipt.update({f"{name}_display_order": orders[rid] for name, rid in anchors.items() if rid in orders})
+        except Exception:
+            # Logical identity is additive; a failed metadata read cannot invalidate committed addresses.
+            logger.debug("persisted turn display identity unavailable", exc_info=True)
     return receipt
 
 

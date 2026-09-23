@@ -9,6 +9,11 @@ import {
   textPart,
   toChatMessages
 } from '@/lib/chat-messages'
+import {
+  conflictingTranscriptIdentity,
+  transcriptOccurrenceIds,
+  transcriptRowIds
+} from '@/lib/chat-messages/occurrence-identity'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
 import { parseErrorSurface } from '@/lib/error-surface'
@@ -59,12 +64,7 @@ import type { SessionCreateResponse, SessionInfo, SessionResumeResult, SessionRu
 
 import type { ClientSessionState } from '../../../types'
 
-import {
-  acknowledgedTranscriptBoundary,
-  conflictingTranscriptIdentity,
-  persistedTurnsEquivalent,
-  transcriptRowIds
-} from './pending-turn-identity'
+import { acknowledgedTranscriptBoundary, persistedTurnsEquivalent } from './pending-turn-identity'
 
 function withAppendedText(message: ChatMessage, suffix: string): ChatMessage {
   let appended = false
@@ -158,8 +158,8 @@ function preserveStructuralParts(message: ChatMessage, previous: ChatMessage): C
 // IGNORED:  fields that are intentionally not compared — display-only metadata
 //           or reference identity the runtime already guarantees.
 //   attachmentRefs — composer-side metadata; already reconciled in reconcileResumeMessages
-//   serverRowSpan — backend rows the folded message covers; the older-page offset
-//                   accounting reads it, the transcript never paints it
+// Provenance and row spans must publish even with unchanged visible parts:
+// preserveEquivalentTranscript otherwise retains stale pagination metadata.
 //
 // If your new field affects what the user sees in the transcript, add it to
 // COMPARED. If it's metadata that shouldn't trigger a re-render, add it to
@@ -170,6 +170,9 @@ const _chatMessageFieldsExhaustive: {
 
 const COMPARED_FIELDS = [
   'rowId',
+  'displayOrder',
+  'serverRows',
+  'serverRowSpan',
   'persistedTurn',
   'durableComplete',
   'recovered',
@@ -193,7 +196,7 @@ const COMPARED_FIELDS = [
   'durationS'
 ] as const
 
-const IGNORED_FIELDS = ['attachmentRefs', 'parts', 'serverRowSpan'] as const
+const IGNORED_FIELDS = ['attachmentRefs', 'parts'] as const
 
 // Compile-time check: every ChatMessagePart discriminant must be handled by
 // chatPartsEquivalent. If @assistant-ui adds a new part type, this fails tsc.
@@ -231,15 +234,19 @@ export function chatPartsEquivalent(aPart: ChatMessage['parts'][number], bPart: 
     return false
   }
 
-  if (aPart.timestamp !== bPart.timestamp || aPart.completedAt !== bPart.completedAt) {
+  if (
+    aPart.timestamp !== bPart.timestamp ||
+    aPart.completedAt !== bPart.completedAt ||
+    aPart.sourceRowId !== bPart.sourceRowId ||
+    aPart.sourceDisplayOrder !== bPart.sourceDisplayOrder ||
+    aPart.sourceCommentaryIndex !== bPart.sourceCommentaryIndex ||
+    aPart.toolResultSource?.rowId !== bPart.toolResultSource?.rowId ||
+    aPart.toolResultSource?.displayOrder !== bPart.toolResultSource?.displayOrder
+  ) {
     return false
   }
 
   if (aPart.type === 'text' || aPart.type === 'reasoning') {
-    if (aPart.sourceRowId !== bPart.sourceRowId) {
-      return false
-    }
-
     return (aPart as { text: string }).text === (bPart as { text: string }).text
   }
 
@@ -292,6 +299,13 @@ export function chatMessagesEquivalent(a: ChatMessage, b: ChatMessage): boolean 
   if (
     a.id !== b.id ||
     a.rowId !== b.rowId ||
+    a.displayOrder !== b.displayOrder ||
+    (a.serverRowSpan ?? 1) !== (b.serverRowSpan ?? 1) ||
+    a.serverRows?.length !== b.serverRows?.length ||
+    a.serverRows?.some(
+      (row, index) =>
+        row.rowId !== b.serverRows?.[index].rowId || row.displayOrder !== b.serverRows?.[index].displayOrder
+    ) ||
     !persistedTurnsEquivalent(a.persistedTurn, b.persistedTurn) ||
     a.role !== b.role ||
     a.durableComplete !== b.durableComplete ||
@@ -348,7 +362,7 @@ export function preserveEquivalentTranscript(current: ChatMessage[], next: ChatM
   return chatMessageArraysEquivalent(current, next) ? current : next
 }
 
-/** Durable history against the local view: role-ordinal pairing, then the
+/** Durable history against the local view: occurrence-first pairing, then the
  *  local pending turn and local assistant errors the DB cannot know about. */
 export function reconcileDurableHistory(messages: ChatMessage[], previous: ChatMessage[]): ChatMessage[] {
   const reconciled = reconcileResumeMessages(messages, previous)
@@ -363,25 +377,49 @@ export function reconcileResumeMessages(nextMessages: ChatMessage[], previousMes
   }
 
   const previousByRoleOrdinal = new Map<string, ChatMessage>()
+  const previousByOccurrence = new Map<string, ChatMessage>()
   const previousRoleCounts = new Map<string, number>()
+  const occurrenceKeys = (message: ChatMessage) => transcriptOccurrenceIds(message).map(id => `${message.role}:${id}`)
 
   for (const message of previousMessages) {
     const ordinal = previousRoleCounts.get(message.role) ?? 0
     previousRoleCounts.set(message.role, ordinal + 1)
     previousByRoleOrdinal.set(`${message.role}:${ordinal}`, message)
+
+    for (const key of occurrenceKeys(message)) {
+      previousByOccurrence.set(key, message)
+    }
   }
 
   const nextRoleCounts = new Map<string, number>()
+  const nextOccurrences = new Set(nextMessages.flatMap(occurrenceKeys))
+  const usedPrevious = new Set<ChatMessage>()
 
   return nextMessages.map(message => {
     const ordinal = nextRoleCounts.get(message.role) ?? 0
     nextRoleCounts.set(message.role, ordinal + 1)
 
-    const previous = previousByRoleOrdinal.get(`${message.role}:${ordinal}`)
+    // History pages and folded bubbles shift role ordinals. Logical source
+    // occurrences survive those shifts and compaction's physical row copies.
+    const occurrenceMatch = occurrenceKeys(message)
+      .map(key => previousByOccurrence.get(key))
+      .find(candidate => candidate && !usedPrevious.has(candidate))
 
-    if (!previous || conflictingTranscriptIdentity(previous, message)) {
+    const previous = occurrenceMatch ?? previousByRoleOrdinal.get(`${message.role}:${ordinal}`)
+
+    if (
+      !previous ||
+      usedPrevious.has(previous) ||
+      conflictingTranscriptIdentity(previous, message) ||
+      // Legacy projections may have no receipt yet, but must not borrow a
+      // cached row whose exact occurrence belongs elsewhere in this page.
+      (!occurrenceMatch && occurrenceKeys(previous).some(key => nextOccurrences.has(key)))
+    ) {
       return message
     }
+
+    usedPrevious.add(previous)
+    const sameOccurrence = occurrenceMatch !== undefined
 
     const nextText = chatMessageText(message).trim()
     const previousText = chatMessageText(previous)
@@ -409,9 +447,8 @@ export function reconcileResumeMessages(nextMessages: ChatMessage[], previousMes
     // Mid-turn, the authoritative text has advanced past the cached copy by one
     // or more deltas. That is still the same turn, and the cached row holds the
     // only copy of its reasoning / tool calls, so treat an extension as a match
-    // for structural carry-over. Attachment refs and image re-appending stay on
-    // the strict equality path — they reconcile a SETTLED row, and a growing
-    // row is by definition not settled.
+    // for structural carry-over. Without an occurrence receipt, attachment
+    // refs still require strict equality; image re-appending always does.
     //
     // Live-tail identity: structure-only same-turn carry is allowed only when
     // the *structure-bearing cached row* is still the in-flight stream
@@ -420,6 +457,7 @@ export function reconcileResumeMessages(nextMessages: ChatMessage[], previousMes
     // role ordinal with an unrelated historical structured row and must not
     // inherit its reasoning/tool parts (#76444 review / salvage).
     const sameTurn =
+      sameOccurrence ||
       sameText ||
       (nextText.length > 0 && previousTrimmed.length > 0 && isStrictAnswerTextExtension(nextText, previousTrimmed)) ||
       (message.role === 'assistant' &&
@@ -432,8 +470,11 @@ export function reconcileResumeMessages(nextMessages: ChatMessage[], previousMes
     if (sameTurn) {
       preserved = preserveStructuralParts(preserved, previous)
 
-      // Never replace structured answer text with a non-extending flat dump.
+      // A stored occurrence can expand through folding, not just a text
+      // extension. Its text stays authoritative; only legacy live flat dumps
+      // need protection from overwriting the structured local answer.
       if (
+        !sameOccurrence &&
         message.role === 'assistant' &&
         hasStructuralParts(previous) &&
         !hasStructuralParts(message) &&
@@ -446,7 +487,7 @@ export function reconcileResumeMessages(nextMessages: ChatMessage[], previousMes
     }
 
     if (
-      sameText &&
+      (sameOccurrence || sameText) &&
       message.role === 'user' &&
       preserved.attachmentRefs === undefined &&
       previous.attachmentRefs?.length
@@ -701,7 +742,9 @@ export function preserveLocalPendingTurnMessages(
     const isOptimisticUser = message.role === 'user' && message.id.startsWith('user-')
 
     const isPendingAssistant =
-      message.role === 'assistant' && (message.pending === true || message.id.startsWith('assistant-stream-'))
+      message.role === 'assistant' &&
+      !message.error &&
+      (message.pending === true || message.id.startsWith('assistant-stream-'))
 
     if (!isOptimisticUser && !isPendingAssistant) {
       continue

@@ -166,6 +166,14 @@ export interface ClientSessionState {
   busy: boolean
   awaitingResponse: boolean
   streamId: string | null
+  /** Local ownership at turn acceptance/adoption, independent of prompt
+   *  hydration and pending/interim presentation. Retired when the turn ends. */
+  completionTurn?: {
+    previousMessageIds: string[]
+    previousOccurrenceIds: number[]
+    previousRowIds: number[]
+    currentMessageIds: string[]
+  }
   sawAssistantPayload: boolean
   /** This window picked up a turn it did not start — it resumed onto a session
    *  that was already running somewhere else (leaving HUD mode, opening a

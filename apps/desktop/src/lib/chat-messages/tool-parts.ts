@@ -6,6 +6,7 @@ import { isTodoToolName, parseTodos } from '@/lib/todos'
 import type { ToolResultMetadata } from '@/lib/tool-result-metadata'
 import type { SessionMessage, StoredToolCallLabels } from '@/types/hermes'
 
+import { sourceRowOccurrence, storedSourceRow } from './occurrence-identity'
 import type { ChatMessage, ChatMessagePart, GatewayEventPayload } from './types'
 
 function toolId(payload: GatewayEventPayload | undefined): string {
@@ -828,10 +829,16 @@ export function applyStoredToolResult(messages: ChatMessage[], toolMessage: Sess
     parts[partIndex] = {
       ...existing,
       completedAt: toolMessage.timestamp,
+      toolResultSource: storedSourceRow(toolMessage),
       result: parseStoredToolResult(content),
       isError: false
     } as ChatMessagePart
-    messages[i] = { ...message, parts, serverRowSpan: (message.serverRowSpan ?? 1) + 1 }
+    messages[i] = {
+      ...message,
+      parts,
+      serverRowSpan: (message.serverRowSpan ?? 1) + 1,
+      ...(message.serverRows ? { serverRows: [...message.serverRows, storedSourceRow(toolMessage)] } : {})
+    }
 
     return true
   }
@@ -862,6 +869,7 @@ export function applyStoredToolResultToParts(
   next[partIndex] = {
     ...existing,
     completedAt: toolMessage.timestamp,
+    toolResultSource: storedSourceRow(toolMessage),
     result: parseStoredToolResult(content),
     isError: false
   } as ChatMessagePart
@@ -870,6 +878,7 @@ export function applyStoredToolResultToParts(
 }
 
 export function storedToolMessagePart(toolMessage: SessionMessage, fallbackIndex: number): ChatMessagePart {
+  const sourceRow = storedSourceRow(toolMessage)
   const name = toolMessage.tool_name || toolMessage.name || 'tool'
   const context = textFromUnknown(toolMessage.context || toolMessage.text || toolMessage.content || '')
   // Prefer the full arguments when the gateway projection carries them:
@@ -882,12 +891,14 @@ export function storedToolMessagePart(toolMessage: SessionMessage, fallbackIndex
 
   return {
     type: 'tool-call',
-    toolCallId: toolMessage.tool_call_id || `stored-tool-message-${fallbackIndex}`,
+    toolCallId: toolMessage.tool_call_id || `stored-tool-message-${sourceRowOccurrence(sourceRow) ?? fallbackIndex}`,
     toolName: name,
     args: args as never,
     argsText: Object.keys(args).length ? JSON.stringify(args) : '',
     timestamp: toolMessage.timestamp,
     completedAt: toolMessage.timestamp,
+    ...(sourceRow.rowId !== undefined ? { sourceRowId: sourceRow.rowId } : {}),
+    ...(sourceRow.displayOrder !== undefined ? { sourceDisplayOrder: sourceRow.displayOrder } : {}),
     result: context ? { context } : {},
     isError: false
   }

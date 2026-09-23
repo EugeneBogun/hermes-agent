@@ -162,6 +162,12 @@ class TranscriptMessage(OpenModel):
     text: str | None = None
     timestamp: float | None = None
     row_id: int | None = None
+    # Logical first-generation row within this session/profile store; not a mutation address.
+    # Absent for legacy unindexed rows; unlike row_id, retained compaction clones share it.
+    display_order: int | None = None
+    # Only these profile-owned, sanitized items may become public commentary.
+    # Empty means suppressed; never fall back to raw codex_message_items.
+    display_commentary: list[str] | None = None
     display_kind: str | None = None
     display_metadata: JsonValue | None = None
     name: str | None = None
