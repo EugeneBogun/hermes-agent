@@ -173,6 +173,36 @@ class TestCreateSession:
         assert set(resolve_toolset(offered)) <= names
         assert not names & set(resolve_toolset(withheld))
 
+    @pytest.mark.parametrize("acp_toolsets, expected_mcp", [
+        (None, {"mcp-alpha", "mcp-beta"}),              # default: every enabled config server
+        (["hermes-acp", "alpha"], {"mcp-alpha"}),       # listed server names are an allowlist
+        (["hermes-acp", "no_mcp"], set()),              # the no_mcp sentinel drops them all
+    ])
+    def test_fresh_agent_mcp_servers_follow_platform_toolsets(self, monkeypatch, acp_toolsets, expected_mcp):
+        """Config MCP servers reach a fresh ACP agent by the gateway's rules for ``platform_toolsets.<platform>``,
+        not unconditionally; a disabled server never does."""
+        seen: list[dict] = []
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                seen.append(kwargs)
+
+        config = {"model": {"default": "m"},
+                  "mcp_servers": {"alpha": {"command": "a"}, "beta": {"command": "b"}, "off": {"enabled": False}}}
+        if acp_toolsets is not None:
+            config["platform_toolsets"] = {"acp": acp_toolsets}
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+        monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **_kw: {})
+        monkeypatch.setattr("hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build", lambda **_kw: None)
+        monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda task_id, cwd: None)
+
+        SessionManager(db=None)._make_agent(session_id="fresh", cwd=".")
+
+        enabled = seen[0]["enabled_toolsets"]
+        assert {t for t in enabled if t.startswith("mcp-")} == expected_mcp
+        assert not {"alpha", "beta", "no_mcp"} & set(enabled)
+
     def test_make_agent_surfaces_the_provider_resolution_failure(self, monkeypatch):
         """#91090: when ``resolve_runtime_provider`` fails, the bare-AIAgent fallback dies with the
         first-run "No LLM provider configured" text; the operator must get the swallowed cause

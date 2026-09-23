@@ -35,9 +35,23 @@ Hermes runs with a curated `hermes-acp` toolset designed for editor workflows. I
 
 It intentionally excludes things that do not fit typical editor UX, such as messaging delivery and cronjob management.
 
-The toolset resolves like every other platform: `platform_toolsets.acp` in
-`config.yaml` (or `hermes tools`) replaces the `hermes-acp` default, and
-`agent.disabled_toolsets` removes toolsets from every ACP session.
+The toolset resolves the same way as on the messaging gateway.
+`platform_toolsets.acp` replaces the `hermes-acp` default, and
+`agent.disabled_toolsets` removes toolsets from every ACP session. MCP
+servers from `mcp_servers` follow the same rules too. By default ACP gets
+every enabled server. If you list server names in `platform_toolsets.acp`,
+only those servers are included, and `no_mcp` drops them all. `hermes tools`
+has no ACP entry, so edit `config.yaml` directly:
+
+```yaml
+platform_toolsets:
+  acp: [file, web, skills, github]   # only the github MCP server
+agent:
+  disabled_toolsets: [code_execution]
+```
+
+MCP servers that the editor sends with `session/new` are separate. The
+client asks for them per session, and they are always added.
 
 ## Installation
 

@@ -119,7 +119,8 @@ Examples:
 ```text
 new_session(cwd)
   -> create SessionState
-  -> create AIAgent(platform="acp", enabled_toolsets=<platform_toolsets.acp, default hermes-acp>,
+  -> create AIAgent(platform="acp", enabled_toolsets=<platform_toolsets.acp, default hermes-acp,
+                   plus mcp-<server> for the config MCP servers it admits>,
                    disabled_toolsets=<agent.disabled_toolsets>)
   -> bind task_id/session_id to cwd override
 
