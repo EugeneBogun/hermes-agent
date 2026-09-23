@@ -35,7 +35,9 @@ Hermes runs with a curated `hermes-acp` toolset designed for editor workflows. I
 
 It intentionally excludes things that do not fit typical editor UX, such as messaging delivery and cronjob management.
 
-The toolset resolves the same way as on the messaging gateway.
+The toolset resolves the same way as on the messaging gateway for the same
+platform config. That includes the extras the gateway adds on top of the
+list, such as enabled plugin toolsets, so ACP sessions get those too.
 `platform_toolsets.acp` replaces the `hermes-acp` default, and
 `agent.disabled_toolsets` removes toolsets from every ACP session. MCP
 servers from `mcp_servers` follow the same rules too. By default ACP gets
@@ -290,6 +292,9 @@ the channel. Buzz does not warn when you pick it.
 but Buzz auto-approves it and the command still runs. To take the shell away,
 narrow the toolset instead: set `platform_toolsets.acp` to a list without
 `terminal` and `code_execution`, or add them to `agent.disabled_toolsets`.
+Even an empty `platform_toolsets.acp: []` still adds enabled plugin
+toolsets, so name any plugin toolset you want gone in
+`agent.disabled_toolsets`.
 
 `!shutdown` from the owner stops the agent in any mode, and Buzz ignores that
 command from everyone else.
