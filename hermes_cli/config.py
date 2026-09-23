@@ -2187,10 +2187,10 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
     # save_config() stores the pre-expansion dict (templates preserved); the load path stores the
     # expanded one. Expand defensively — idempotent when already expanded.
     lkg_copy = FailedConfigRead(_expand_env_vars(copy.deepcopy(lkg)), error=exc)
-    if cache_sig is not None and not isinstance(exc, OSError):
-        # Cache under the corrupt file's signature (empty env snapshot: always valid) so repeated
-        # loads don't re-parse; fixing the file changes the signature and reloads normally. A read
-        # error leaves an intact file behind, so the next load must retry it.
+    if cache_sig is not None:
+        # Cache under the failed file's signature (empty env snapshot: always valid) so repeated
+        # loads don't re-parse the fallback; fixing the file changes the signature and reloads
+        # normally, and a read error is re-probed on every hit (_load_config_cache_hit).
         _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, lkg_copy, {})
     return lkg_copy
 
@@ -2214,7 +2214,7 @@ def _merge_managed_overlay(expanded: Dict[str, Any]) -> Tuple[Dict[str, Any], An
 
 
 def _load_config_cache_hit(path_key: str, cache_sig: Any) -> Optional[Dict[str, Any]]:
-    """Pure lookup: the cached expanded config for ``path_key`` if its signature equals
+    """Lookup: the cached expanded config for ``path_key`` if its signature equals
     ``cache_sig`` AND every ``${VAR}`` it was expanded against still has the same value, else
     ``None``. Signatures matching is not enough: a load before load_hermes_dotenv() would otherwise
     pin unexpanded literals (e.g. auxiliary.<task>.api_key) for the process lifetime (#58514).
@@ -2222,9 +2222,19 @@ def _load_config_cache_hit(path_key: str, cache_sig: Any) -> Optional[Dict[str, 
     cached = _LOAD_CONFIG_CACHE.get(path_key)
     if cached is None or cache_sig is None or cached[:8] != cache_sig:
         return None
+    hit = cached[8]
+    if isinstance(hit, FailedConfigRead) and isinstance(hit.read_error, OSError):
+        # A read error (EMFILE/EIO/sharing violation) can clear without touching the file's
+        # signature: serve the fallback only while the file still cannot be read.
+        try:
+            with open(path_key, "rb") as f:
+                f.read()
+            return None
+        except OSError:
+            return hit
     env_snapshot = cached[9] if len(cached) > 9 else {}
     if all(_env_ref_lookup(k) == v for k, v in env_snapshot.items()):
-        return cached[8]
+        return hit
     return None
 
 
@@ -2283,10 +2293,10 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 if lkg_copy is not None:
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
                 # Defaults stand in for the unreadable file: never the next last-known-good,
-                # never saveable, and (like the LKG path) cached only for a parse error.
+                # never saveable, and cached like the LKG path.
                 fallback = FailedConfigRead(
                     _merge_managed_overlay(_expand_env_vars(_canonicalize_config(config)))[0], error=e)
-                if cache_sig is not None and not isinstance(e, OSError):
+                if cache_sig is not None:
                     _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, fallback, {})
                 return copy.deepcopy(fallback) if want_deepcopy else fallback
 

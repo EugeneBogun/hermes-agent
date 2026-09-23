@@ -152,6 +152,35 @@ def test_transient_read_error_is_not_recorded_as_a_corrupt_config(read, home, mo
     assert "could not be read" in capsys.readouterr().err
 
 
+def test_unreadable_config_serves_one_cached_fallback_until_it_reads(home, monkeypatch):
+    """While config.yaml stays unreadable, loads serve one cached fallback (the backup is parsed
+    once, not per call: ~250x slower loads before), and the first load once the file opens again
+    reads the real file even though its signature never changed."""
+    import builtins
+    from hermes_cli import config_backups
+    from hermes_cli.config_read_errors import FailedConfigRead
+    path = home / "config.yaml"
+    _fresh_process(home, _CONFIG)
+    load_config()  # leaves the `good` backup a fresh process falls back to
+    config_mod._LOAD_CONFIG_CACHE.clear()
+    config_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    blocked, rebuilds, real_backup = [True], [], config_backups.load_newest_good_backup
+
+    def guarded_open(file, *args, **kwargs):
+        if blocked[0] and str(file) == str(path):
+            raise OSError(errno.EMFILE, "Too many open files")
+        return builtins.open(file, *args, **kwargs)
+    monkeypatch.setattr(config_mod, "open", guarded_open, raising=False)
+    monkeypatch.setattr(config_backups, "load_newest_good_backup", lambda p: rebuilds.append(p) or real_backup(p))
+
+    for _ in range(5):
+        cfg = load_config()
+        assert isinstance(cfg, FailedConfigRead) and cfg["display"]["skin"] == "mono"
+    assert len(rebuilds) == 1
+    blocked[0] = False
+    assert type(load_config()) is dict
+
+
 @pytest.mark.parametrize("operation", ["save", "partial_save", "migrate"])
 def test_authored_nulls_survive_config_writes(tmp_path, monkeypatch, operation):
     from hermes_cli.resource_limits import configured_nofile_soft_limit
