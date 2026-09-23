@@ -35,6 +35,10 @@ Hermes runs with a curated `hermes-acp` toolset designed for editor workflows. I
 
 It intentionally excludes things that do not fit typical editor UX, such as messaging delivery and cronjob management.
 
+The toolset resolves like every other platform: `platform_toolsets.acp` in
+`config.yaml` (or `hermes tools`) replaces the `hermes-acp` default, and
+`agent.disabled_toolsets` removes toolsets from every ACP session.
+
 ## Installation
 
 Install Hermes normally, then add the ACP extra from the install checkout:
@@ -268,12 +272,10 @@ therefore runs shell commands on the host without prompting. I asked one to run
 Selecting `Anyone` hands that same shell access to every author who can reach
 the channel. Buzz does not warn when you pick it.
 
-Neither of the obvious mitigations works today:
-
-- `approvals.mode: manual` does make Hermes raise the permission request, but
-  Buzz auto-approves it and the command still runs.
-- `platform_toolsets.acp` does not narrow the ACP toolset, so it cannot be used
-  to drop `terminal`.
+`approvals.mode: manual` does not help: Hermes raises the permission request,
+but Buzz auto-approves it and the command still runs. To take the shell away,
+narrow the toolset instead: set `platform_toolsets.acp` to a list without
+`terminal` and `code_execution`, or add them to `agent.disabled_toolsets`.
 
 `!shutdown` from the owner stops the agent in any mode, and Buzz ignores that
 command from everyone else.
