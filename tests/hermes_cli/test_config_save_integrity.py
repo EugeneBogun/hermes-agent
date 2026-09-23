@@ -181,6 +181,16 @@ def test_unreadable_config_serves_one_cached_fallback_until_it_reads(home, monke
     assert type(load_config()) is dict
 
 
+def test_save_refusal_for_bad_yaml_asks_for_an_edit_not_a_retry(home):
+    _fresh_process(home, "model: [unclosed\n")
+    cfg = load_config()
+    cfg["display"]["skin"] = "ares"
+    with pytest.raises(RuntimeError, match="has a formatting error") as refusal:
+        save_config(cfg)
+    assert "hermes config edit" in str(refusal.value) and "Try again" not in str(refusal.value)
+    assert (home / "config.yaml").read_text(encoding="utf-8") == "model: [unclosed\n"
+
+
 @pytest.mark.parametrize("operation", ["save", "partial_save", "migrate"])
 def test_authored_nulls_survive_config_writes(tmp_path, monkeypatch, operation):
     from hermes_cli.resource_limits import configured_nofile_soft_limit

@@ -34,6 +34,10 @@ _PARSE_FAILURE_FALLBACK_MSG = {
 _PARSE_FAILURE_DEFAULTS_MSG = (
     "Hermes is running on default settings until it is fixed, so none of your saved settings are applied.")
 _PARSE_FAILURE_REPAIR_MSG = "Open it with `hermes config edit`, fix {where}, then run `hermes config check`."
+_FIX_PERMS = "Fix the file permissions or move it aside first."
+_FIX_YAML = (
+    "Fix it with `hermes config edit` and check with `hermes config check`, or copy the newest good "
+    "file from {backups} over config.yaml.")
 
 
 def _yaml_error_location(exc: Exception) -> str:
@@ -57,8 +61,7 @@ def format_config_parse_failure(config_path: Path, exc: Exception, *, fallback: 
     at = f" at {where}" if where else ""
     fallback_msg = _PARSE_FAILURE_FALLBACK_MSG.get(fallback, _PARSE_FAILURE_DEFAULTS_MSG)
     if isinstance(exc, OSError):  # the file is intact; EMFILE/EIO/sharing violation, not a YAML problem
-        return (f"Your settings file ({config_path}) could not be read. {fallback_msg} "
-                "Try again; run `hermes config check` if it keeps failing.")
+        return f"Your settings file ({config_path}) could not be read. {fallback_msg} {_read_error_fix(exc)}"
     repair = _PARSE_FAILURE_REPAIR_MSG.format(where=where or "the problem")
     return f"Your settings file ({config_path}) has a formatting error{at}. {fallback_msg} {repair}"
 
@@ -120,11 +123,20 @@ class FailedConfigRead(dict):
         self.read_error = error
 
 
+def _read_error_fix(exc: OSError) -> str:
+    return _FIX_PERMS if isinstance(exc, PermissionError) else (
+        "Try again; run `hermes config check` if it keeps failing.")
+
+
 def _refuse_failed_read(config_path: Path, data: Any) -> None:
-    if isinstance(data, FailedConfigRead):
-        raise _refuse_overwrite(
-            config_path, "could not be read", data.read_error,
-            "Try again; run `hermes config check` if it keeps failing.")
+    """Refuse to save a fallback; only a read error is worth retrying, bad YAML needs an edit."""
+    if not isinstance(data, FailedConfigRead):
+        return
+    exc = data.read_error
+    if isinstance(exc, OSError):
+        raise _refuse_overwrite(config_path, "could not be read", exc, _read_error_fix(exc))
+    raise _refuse_overwrite(
+        config_path, "has a formatting error", exc, _FIX_YAML.format(backups=_backups_dir_display()))
 
 
 def _refuse_overwrite(config_path: Path, reason: str, exc: Exception, fix: str) -> RuntimeError:
@@ -139,9 +151,3 @@ def _refuse_overwrite(config_path: Path, reason: str, exc: Exception, fix: str) 
 def _backups_dir_display() -> str:
     from hermes_constants import display_hermes_home
     return f"{display_hermes_home()}/backups/config/"
-
-
-_FIX_PERMS = "Fix the file permissions or move it aside first."
-_FIX_YAML = (
-    "Fix it with `hermes config edit` and check with `hermes config check`, or copy the newest good "
-    "file from {backups} over config.yaml.")
