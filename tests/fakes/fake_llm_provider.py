@@ -49,6 +49,7 @@ class Text:
     prompt_tokens: int = 100
     completion_tokens: int = 20
     cached_tokens: int = 0
+    finish_reason: str = "stop"
 
 
 @dataclass
@@ -126,12 +127,16 @@ class FakeLLMServer:
         default_text: str = "ok",
         aux: Responder | None = None,
         api_key: str | None = None,
+        prompt_tokens_fn: Callable[[dict[str, Any]], int] | None = None,
     ) -> None:
         self._script: list[Response] = list(script) if isinstance(script, list) else []
         self._responder: Responder | None = script if callable(script) else None
         self.default_text = default_text
         self._aux = aux or (lambda _req: Text("Fake summary of the earlier conversation."))
         self.expected_api_key = api_key
+        # Optional: derive reported ``usage.prompt_tokens`` from each request body (so token-driven
+        # logic such as compaction triggers sees a realistic, growing count instead of a constant).
+        self.prompt_tokens_fn = prompt_tokens_fn
         self.requests: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -255,10 +260,11 @@ def _handler_for(server: FakeLLMServer) -> type[BaseHTTPRequestHandler]:
                 return
             resp = server._next_main(record) if kind == "main" else server._aux(record)
             record["response"] = type(resp).__name__
-            self._respond(resp, bool(body.get("stream")))
+            prompt_tokens = server.prompt_tokens_fn(body) if server.prompt_tokens_fn else None
+            self._respond(resp, bool(body.get("stream")), prompt_tokens)
 
         # response rendering
-        def _respond(self, resp: Response, stream: bool) -> None:
+        def _respond(self, resp: Response, stream: bool, prompt_tokens: int | None = None) -> None:
             if isinstance(resp, Error):
                 headers = {"Retry-After": str(resp.retry_after)} if resp.retry_after is not None else {}
                 self._send_json(resp.status, {"error": {"message": resp.message, "type": "server_error"}}, headers)
@@ -288,7 +294,7 @@ def _handler_for(server: FakeLLMServer) -> type[BaseHTTPRequestHandler]:
                 self.wfile.flush()
                 self.close_connection = True
                 return
-            message, finish, usage = _message_for(resp, server)
+            message, finish, usage = _message_for(resp, server, prompt_tokens)
             if not stream:
                 self._send_json(200, {
                     "id": "chatcmpl-fake", "object": "chat.completion", "created": int(time.time()),
@@ -351,18 +357,21 @@ def _chunk(delta: dict[str, Any], finish: str | None = None) -> dict[str, Any]:
     }
 
 
-def _message_for(resp: Text | ToolCall, server: FakeLLMServer) -> tuple[dict[str, Any], str, dict[str, Any]]:
+def _message_for(
+    resp: Text | ToolCall, server: FakeLLMServer, prompt_tokens: int | None = None,
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
     if isinstance(resp, Text):
         message: dict[str, Any] = {"role": "assistant", "content": resp.text}
         if resp.reasoning:
             message["reasoning_content"] = resp.reasoning
+        pt = resp.prompt_tokens if prompt_tokens is None else prompt_tokens
         usage = {
-            "prompt_tokens": resp.prompt_tokens,
+            "prompt_tokens": pt,
             "completion_tokens": resp.completion_tokens,
-            "total_tokens": resp.prompt_tokens + resp.completion_tokens,
+            "total_tokens": pt + resp.completion_tokens,
             "prompt_tokens_details": {"cached_tokens": resp.cached_tokens},
         }
-        return message, "stop", usage
+        return message, resp.finish_reason, usage
     calls = [(resp.name, resp.args), *resp.parallel]
     tool_calls = [
         {"id": server.next_tool_call_id(), "type": "function",
@@ -370,7 +379,8 @@ def _message_for(resp: Text | ToolCall, server: FakeLLMServer) -> tuple[dict[str
         for name, args in calls
     ]
     message = {"role": "assistant", "content": resp.text, "tool_calls": tool_calls}
-    usage = {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}
+    pt = 100 if prompt_tokens is None else prompt_tokens
+    usage = {"prompt_tokens": pt, "completion_tokens": 10, "total_tokens": pt + 10}
     return message, "tool_calls", usage
 
 
