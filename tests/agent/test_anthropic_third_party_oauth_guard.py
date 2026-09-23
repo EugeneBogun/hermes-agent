@@ -75,6 +75,28 @@ class TestOAuthFlagOnRefresh:
         # And the flag is untouched regardless.
         assert agent._is_anthropic_oauth is False
 
+    def test_third_party_endpoint_skips_refresh(self, agent):
+        """provider == 'anthropic' on a third-party endpoint must not refresh: the refresh
+        would swap in native Anthropic credentials the endpoint was never given."""
+        agent.api_mode = "anthropic_messages"
+        agent.provider = "anthropic"
+        agent._anthropic_api_key = "custom-api-key"
+        agent._anthropic_base_url = "https://llmbox.bytedance.net"
+        agent._anthropic_client = MagicMock()
+        agent._is_anthropic_oauth = False
+
+        with (
+            patch("agent.anthropic_credentials.resolve_anthropic_token",
+                  return_value=_OAUTH_LIKE_TOKEN),
+            patch("agent.anthropic_adapter.build_anthropic_client",
+                  return_value=MagicMock()),
+        ):
+            result = agent._try_refresh_anthropic_client_credentials()
+
+        assert result is False
+        assert agent._anthropic_api_key == "custom-api-key"
+        assert agent._is_anthropic_oauth is False
+
 
 
 class TestOAuthFlagOnCredentialSwap:
