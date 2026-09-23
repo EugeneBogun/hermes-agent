@@ -119,7 +119,8 @@ class ParityHome:
         self.update_config(lambda cfg: cfg.setdefault("terminal", {}).__setitem__("cwd", str(self.project)))
 
 
-def build_parity_home(root: Path, base_url: str, *, grandchild: bool = True) -> ParityHome:
+def build_parity_home(root: Path, base_url: str, *, grandchild: bool = True,
+                      death_tool: bool = False, mcp_timeout: int = 60) -> ParityHome:
     """Write the full fixture home under ``root`` (a tmp_path)."""
     home = root / "home"
     hermes_home = home / ".hermes"
@@ -149,14 +150,22 @@ def build_parity_home(root: Path, base_url: str, *, grandchild: bool = True) -> 
             "PARITY_MCP_CANARY": c["mcp"],
             "PARITY_MCP_PID_LOG": str(ph.pid_log),
             "PARITY_MCP_SPAWN_GRANDCHILD": "1" if grandchild else "0",
+            "PARITY_MCP_DEATH_TOOL": "1" if death_tool else "0",
             "PARITY_TREE_TAG": tag,
             # Only the MCP server and its descendants carry this one.
             "PARITY_MCP_TREE_TAG": tag,
             "PYTHONPATH": str(REPO_ROOT),
         },
         "connect_timeout": 60,
-        "timeout": 60,
+        "timeout": mcp_timeout,
     }}
+    # Interactive surfaces wait only ~1.5 s (mcp_discovery_timeout) for MCP discovery
+    # before the first agent build, BY DESIGN (a slow server must not block the
+    # shell; late tools arrive via refresh). Under a loaded box the fixture server's
+    # import alone can exceed that, so pin the documented knob high: the join returns
+    # the instant discovery finishes, and the first turn is deterministically complete.
+    cfg["mcp_discovery_timeout"] = 120
+    cfg["mcp_single_query_discovery_timeout"] = 120
     # Keep turns hermetic and short: no title/aux model chatter decides anything here.
     cfg.setdefault("display", {})["compact"] = True
     (hermes_home / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
@@ -212,7 +221,7 @@ def build_parity_home(root: Path, base_url: str, *, grandchild: bool = True) -> 
 # Scripted provider -----------------------------------------------------------
 
 
-def parity_responder(nonce: str) -> Callable[[dict[str, Any]], Any]:
+def parity_responder(nonce: str, tool: str = MCP_TOOL_NAME) -> Callable[[dict[str, Any]], Any]:
     """Stateless script: call the MCP tool until a tool result exists, then answer.
 
     Stateless so a retried request (or a second concurrent entrypoint request)
@@ -224,16 +233,16 @@ def parity_responder(nonce: str) -> Callable[[dict[str, Any]], Any]:
         if any(m.get("role") == "tool" for m in body.get("messages") or []):
             return Text(FINAL_ANSWER)
         args = {"nonce": nonce}
-        if MCP_TOOL_NAME in _tool_names(body) or "tool_call" not in _tool_names(body):
-            return ToolCall(MCP_TOOL_NAME, args)
+        if tool in _tool_names(body) or "tool_call" not in _tool_names(body):
+            return ToolCall(tool, args)
         # Tool Search active: MCP tools sit in the deferred catalog behind the bridge.
-        return ToolCall("tool_call", {"calls": [{"name": MCP_TOOL_NAME, "arguments": args}]})
+        return ToolCall("tool_call", {"calls": [{"name": tool, "arguments": args}]})
 
     return respond
 
 
-def start_provider(nonce: str) -> FakeLLMServer:
-    srv = FakeLLMServer(parity_responder(nonce))
+def start_provider(nonce: str, tool: str = MCP_TOOL_NAME) -> FakeLLMServer:
+    srv = FakeLLMServer(parity_responder(nonce, tool))
     srv.start()
     return srv
 

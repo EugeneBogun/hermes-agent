@@ -8,7 +8,10 @@ plumbing) instead of a registered-but-dead schema.
 ``PARITY_MCP_SPAWN_GRANDCHILD=1`` makes the server fork a long-lived grandchild at
 startup (the shape of npx/uvx wrappers and servers with worker helpers) so
 shutdown tests can prove Hermes reaps the whole process tree, not just its direct
-child. Every PID the server owns is appended to ``PARITY_MCP_PID_LOG`` so the test
+child. ``PARITY_MCP_DEATH_TOOL=1`` adds ``parity_die``, which kills the server while its
+own call is in flight, leaving a helper holding the stdio pipe open so no EOF ever
+arrives (the fast-death supervisor's target shape, #81995).
+Every PID the server owns is appended to ``PARITY_MCP_PID_LOG`` so the test
 can check liveness of exactly the processes this fixture created.
 """
 
@@ -17,6 +20,8 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
+import time
 
 
 def _log_pid(kind: str, pid: int) -> None:
@@ -52,6 +57,20 @@ def main() -> None:
     def parity_canary(nonce: str = "") -> str:
         """Return the parity fixture canary (echoing the caller's nonce)."""
         return f"{os.environ.get('PARITY_MCP_CANARY', 'NO-CANARY')}:{nonce}"
+
+    if os.environ.get("PARITY_MCP_DEATH_TOOL") == "1":
+        @server.tool()
+        def parity_die(nonce: str = "") -> str:
+            """Crash this MCP server mid-call: the RPC never gets a response."""
+            # A helper that inherits our stdio keeps the pipe open after we die (the
+            # npx/uvx-wrapper shape), so the client never sees EOF: only the child
+            # liveness watch can end the call.
+            holder = subprocess.Popen([sys.executable, "-c", "import time\nwhile True: time.sleep(60)"])
+            _log_pid("pipe_holder", holder.pid)
+            _log_pid("dying_server", os.getpid())
+            threading.Timer(0.3, lambda: os._exit(3)).start()
+            time.sleep(3600)
+            return "unreachable"
 
     server.run(transport="stdio")
 
