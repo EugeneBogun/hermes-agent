@@ -129,6 +129,29 @@ def test_no_single_transient_read_error_reaches_the_file(write, last_known_good,
         assert path.read_bytes() == good_after, f"read {k}/{reads} failed, the saved file differs"
 
 
+@pytest.mark.parametrize("read", [load_config, read_raw_config], ids=["load_config", "read_raw_config"])
+def test_transient_read_error_is_not_recorded_as_a_corrupt_config(read, home, monkeypatch, capsys):
+    """One EMFILE on an intact file must not leave the process treating config.yaml as corrupt: the
+    provider auto-resolution refusal (`corrupt_config`) keyed on the file signature would otherwise
+    fire until the file is next edited, and the good file would be copied away as `.corrupt`."""
+    from hermes_cli.auth import _refuse_env_adoption_if_config_corrupt
+    from hermes_cli.config import get_active_config_parse_failure
+    path = home / "config.yaml"
+    _fresh_process(home, _CONFIG)
+    config_mod._CONFIG_PARSE_WARNED.clear()
+    faults = _ReadFaults(monkeypatch, path)
+    faults.arm(1)
+
+    read()
+    assert get_active_config_parse_failure() is not None  # unreadable right now: the refusal holds
+    assert read()["display"]["skin"] == "mono"
+
+    assert get_active_config_parse_failure() is None
+    _refuse_env_adoption_if_config_corrupt()
+    assert not list((home / "backups").glob("**/*.corrupt.*"))
+    assert "could not be read" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("operation", ["save", "partial_save", "migrate"])
 def test_authored_nulls_survive_config_writes(tmp_path, monkeypatch, operation):
     from hermes_cli.resource_limits import configured_nofile_soft_limit

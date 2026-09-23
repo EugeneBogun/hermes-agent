@@ -94,6 +94,9 @@ def format_config_parse_failure(config_path: Path, exc: Exception, *, fallback: 
     where = _yaml_error_location(exc)
     at = f" at {where}" if where else ""
     fallback_msg = _PARSE_FAILURE_FALLBACK_MSG.get(fallback, _PARSE_FAILURE_DEFAULTS_MSG)
+    if isinstance(exc, OSError):  # the file is intact; EMFILE/EIO/sharing violation, not a YAML problem
+        return (f"Your settings file ({config_path}) could not be read. {fallback_msg} "
+                "Try again; run `hermes config check` if it keeps failing.")
     repair = _PARSE_FAILURE_REPAIR_MSG.format(where=where or "the problem")
     return f"Your settings file ({config_path}) has a formatting error{at}. {fallback_msg} {repair}"
 
@@ -118,7 +121,8 @@ def _warn_config_parse_failure(
         return
     _CONFIG_PARSE_WARNED.add(key)
     from hermes_cli.config_backups import backup_config
-    backup_path = backup_config(config_path, "corrupt")
+    # A read error leaves an intact file behind: no "corrupt" copy of a good file.
+    backup_path = None if isinstance(exc, OSError) else backup_config(config_path, "corrupt")
     msg = format_config_parse_failure(config_path, exc, fallback=fallback)
     if backup_path is not None:
         msg += f" A copy of the broken file was saved to {backup_path}."
@@ -2013,6 +2017,7 @@ def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
 
         if not isinstance(data, dict):
             return FailedConfigRead(error=TypeError(f"top-level YAML must be a mapping, got {type(data).__name__}"))
+        _CONFIG_PARSE_FAILURES.pop(path_key, None)  # the file reads now (a transient error left the record)
         # The cache stores its own deepcopy. The readonly path returns THAT object (identity
         # invariant: later cache hits return the same dict); the mutable path returns the parse.
         cached_copy = copy.deepcopy(data)
@@ -2384,6 +2389,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             try:
                 with open(config_path, encoding="utf-8") as f:
                     user_config = fast_safe_load(f) or {}
+                _CONFIG_PARSE_FAILURES.pop(path_key, None)  # the file reads now (a transient error left the record)
 
                 if "max_turns" in user_config:
                     agent_user_config = dict(user_config.get("agent") or {})
