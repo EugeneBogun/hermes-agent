@@ -118,8 +118,9 @@ def _resolve_openrouter_runtime(
 ) -> Dict[str, Any]:
     """Terminal resolver: OpenRouter, or a bare/aliased ``custom`` endpoint. base_url precedence:
     explicit > CUSTOM_BASE_URL > trusted ``model.base_url`` > OPENROUTER_BASE_URL > default.
-    OPENAI_BASE_URL is deliberately NOT consulted — config.yaml is the single source of truth for
-    endpoint URLs. OpenRouter contexts prefer OPENROUTER_API_KEY; custom endpoints never receive the
+    OPENAI_BASE_URL never picks the endpoint (config.yaml is the single source of truth for endpoint
+    URLs); it is read only to keep an OPENAI_API_KEY bound to another host out of the OpenRouter
+    fallback. OpenRouter contexts prefer OPENROUTER_API_KEY; custom endpoints never receive the
     OpenRouter key and only get env keys gated on their authoritative hosts."""
     rp = _rp()
     model_cfg = rp._get_model_config()
