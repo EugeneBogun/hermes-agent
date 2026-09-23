@@ -190,8 +190,11 @@ def kill_tagged(tag: str) -> None:
         except OSError:
             pass
         except RuntimeError:
+            pidfd_open = getattr(os, "pidfd_open", None)  # absent on some Python builds
+            if pidfd_open is None:
+                continue
             try:
-                fd = os.pidfd_open(pid)
+                fd = pidfd_open(pid)
             except OSError:
                 continue
             try:

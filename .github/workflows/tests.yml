@@ -187,7 +187,10 @@ jobs:
           # fetching a manifest from raw.githubusercontent.com on EVERY job —
           # a transient fetch failure fails the whole job (2026-07-28 slice-5
           # incident). Pinned, the binary downloads directly; no manifest hop.
-          version: "0.9.28"
+          # Newer than the unit job's pin on purpose: 0.9.28 only knows CPython
+          # 3.11.14, whose bundled SQLite has the WAL-reset bug, so Hermes runs
+          # state.db in DELETE mode and the WAL torture chamber would skip.
+          version: "0.12.13"
           # Persist uv's download/wheel cache (~/.cache/uv) across runs.
           # Keyed on the dependency manifests, so the cache is reused until
           # pyproject.toml or uv.lock changes. `uv sync` still runs every
@@ -199,7 +202,7 @@ jobs:
             uv.lock
 
       - name: Set up Python 3.11
-        run: uv python install 3.11
+        run: uv python install 3.11.15
 
       - name: Install dependencies
         # `uv sync --locked` installs the exact pinned set from uv.lock (and
@@ -213,12 +216,19 @@ jobs:
         # in the venv up front.
         uses: ./.github/actions/retry
         with:
-          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra parallel-web
+          command: uv sync --locked --python 3.11.15 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra parallel-web
 
       - name: Minimize uv cache
         # Optimized for CI: prunes pre-built wheels that are cheap to
         # re-download, keeping the persisted cache small and fast to restore.
         run: uv cache prune --ci
+
+      - name: Require a WAL-capable SQLite
+        # The state.db suites skip on a WAL-reset-vulnerable SQLite; fail
+        # instead of reporting green over zero coverage.
+        run: |
+          source .venv/bin/activate
+          python -c "import sqlite3, hermes_state_wal as w; print('sqlite', sqlite3.sqlite_version); assert not w.is_sqlite_wal_reset_vulnerable()"
 
       - name: Run e2e tests
         # One subprocess per file, in parallel: the core suites spawn real
