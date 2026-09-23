@@ -135,10 +135,10 @@ def test_transient_read_error_is_not_recorded_as_a_corrupt_config(read, home, mo
     provider auto-resolution refusal (`corrupt_config`) keyed on the file signature would otherwise
     fire until the file is next edited, and the good file would be copied away as `.corrupt`."""
     from hermes_cli.auth import _refuse_env_adoption_if_config_corrupt
-    from hermes_cli.config import get_active_config_parse_failure
+    from hermes_cli.config_read_errors import _CONFIG_PARSE_WARNED, get_active_config_parse_failure
     path = home / "config.yaml"
     _fresh_process(home, _CONFIG)
-    config_mod._CONFIG_PARSE_WARNED.clear()
+    _CONFIG_PARSE_WARNED.clear()
     faults = _ReadFaults(monkeypatch, path)
     faults.arm(1)
 

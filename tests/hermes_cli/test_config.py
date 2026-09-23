@@ -167,8 +167,8 @@ class TestLoadConfigParseFailure:
         Ported from google-gemini/gemini-cli#21541 (policy-file TOML recovery),
         adapted: we back up but deliberately do NOT reset config.yaml.
         """
-        from hermes_cli import config as cfg_mod
-        cfg_mod._CONFIG_PARSE_WARNED.clear()
+        from hermes_cli.config_read_errors import _CONFIG_PARSE_WARNED
+        _CONFIG_PARSE_WARNED.clear()
 
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             broken = "\tmodel: test/custom\nbroken indent:\n"
@@ -200,8 +200,8 @@ class TestLoadConfigParseFailure:
         parses again.
         """
         import time
-        from hermes_cli import config as cfg_mod
-        cfg_mod._CONFIG_PARSE_WARNED.clear()
+        from hermes_cli.config_read_errors import _CONFIG_PARSE_WARNED
+        _CONFIG_PARSE_WARNED.clear()
 
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             cfg = tmp_path / "config.yaml"
