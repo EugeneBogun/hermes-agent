@@ -581,21 +581,17 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                             return
                         continue
                     await self._seal_overflow_heads()
-                    # A seal clears the edit target MID-ITERATION, so the overflow gate
-                    # checked above is already stale. A buffer that still overflows then
-                    # reaches ``_push_update`` -> ``_first_send`` with no message to edit,
-                    # on a NON-final tick: the adapter publishes it as numbered, capped
-                    # chunks, and the turn-final lane later publishes the same text again
-                    # with a different denominator. Observed in production on Discord:
-                    # a single 36k-char turn delivered as ``(i/10)`` and ``(i/9)``, with
-                    # chunk 1 byte-identical between the two. Re-check the gate
-                    # and hand the leftover to the consumer's own splitter, which owns
-                    # sealing and the final ledger.
+                    # Sealing clears the message id, so the gate above is stale: a remainder still
+                    # over the limit must be split again. A plain first send lets the adapter split
+                    # it and adopt only the LAST chunk as the preview; the next seal overwrites that
+                    # chunk with the head of the whole remainder (duplicated + lost text, #25349).
+                    # `continue` like the gate above: the tail is still unsent, and the segment-break
+                    # reset below would clear it.
                     if not self._use_native_streaming and self._first_send_overflows():
                         if await self._split_first_send(tick):
                             return
-                    else:
-                        await self._push_update(tick)
+                        continue
+                    await self._push_update(tick)
 
                 if tick.got_done:
                     await self._finalize_turn(tick)
@@ -769,7 +765,11 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             reply_to = new_id
 
         if heads_delivered:
-            self._accumulated = chunks[-1]
+            # truncate_message suffixes multi-chunk output with " (n/n)"; the tail is the LIVE
+            # preview later deltas extend, so a kept indicator ends up embedded mid-reply.
+            tail = chunks[-1]
+            indicator = f" ({len(chunks)}/{len(chunks)})"
+            self._accumulated = tail[: -len(indicator)] if tail.endswith(indicator) else tail
             # Flag BEFORE the tail send: fresh-final replaces every tracked preview
             # with one message, which is only valid while the active message holds
             # the whole answer — deleting sealed heads drops delivered text.

@@ -736,7 +736,12 @@ class TestInitialOverflowRollingEdit:
         assert all(text.count("```") % 2 == 0 for text in sent_texts + edited_texts)
         assert len(sent_texts) == len(expected_chunks)
         assert sent_texts[:-1] == expected_chunks[:-1]
-        assert sent_texts[-1].startswith(expected_chunks[-1])
+        # The tail is the live preview later deltas extend: it drops the " (n/n)" indicator, which
+        # would otherwise end up embedded mid-reply ("``` (2/2)\nTail after ...").
+        indicator = f" ({len(expected_chunks)}/{len(expected_chunks)})"
+        assert expected_chunks[-1].endswith(indicator)
+        assert sent_texts[-1].startswith(expected_chunks[-1][: -len(indicator)])
+        assert not any(indicator in text for text in edited_texts)
         assert any("Tail after the fenced stream." in text for text in edited_texts)
         assert all(utf16_len(text) <= safe_limit for text in sent_texts)
 
