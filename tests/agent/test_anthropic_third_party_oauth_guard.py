@@ -75,13 +75,17 @@ class TestOAuthFlagOnRefresh:
         # And the flag is untouched regardless.
         assert agent._is_anthropic_oauth is False
 
-    def test_third_party_endpoint_skips_refresh(self, agent):
+    @pytest.mark.parametrize("base_url", [
+        "https://llmbox.bytedance.net",
+        "http://127.0.0.1:8080/anthropic.com",  # substring spoof: the host is still foreign
+    ])
+    def test_third_party_endpoint_skips_refresh(self, agent, base_url):
         """provider == 'anthropic' on a third-party endpoint must not refresh: the refresh
         would swap in native Anthropic credentials the endpoint was never given."""
         agent.api_mode = "anthropic_messages"
         agent.provider = "anthropic"
         agent._anthropic_api_key = "custom-api-key"
-        agent._anthropic_base_url = "https://llmbox.bytedance.net"
+        agent._anthropic_base_url = base_url
         agent._anthropic_client = MagicMock()
         agent._is_anthropic_oauth = False
 

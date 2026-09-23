@@ -872,13 +872,14 @@ class ClientLifecycleMixin:
     def _try_refresh_anthropic_client_credentials(self) -> bool:
         # Only native Anthropic rotates OAuth tokens; other anthropic_messages providers (MiniMax, Alibaba, ...)
         # and Azure use static keys — a refresh would pick up the ~/.claude OAuth token and break auth.
-        # Third-party Anthropic-compatible endpoints under provider 'anthropic' use static keys too;
-        # skip them with the same detection build_anthropic_client uses.
-        from agent.anthropic_endpoints import _is_third_party_anthropic_endpoint
+        # Any other host under provider 'anthropic' (a URL-bearing alias, #28660) holds no Anthropic
+        # credential either: refreshing would ship ANTHROPIC_API_KEY / the OAuth token to it. Match
+        # the hostname, not a substring, so ``proxy.example/anthropic.com`` stays foreign.
+        anthropic_base_url = getattr(self, "_anthropic_base_url", "") or ""
         if (
             self.api_mode != "anthropic_messages" or not hasattr(self, "_anthropic_api_key")
             or self.provider != "anthropic"
-            or _is_third_party_anthropic_endpoint(getattr(self, "_anthropic_base_url", "") or "")
+            or (anthropic_base_url and not base_url_host_matches(anthropic_base_url, "anthropic.com"))
         ):
             return False
         try:
