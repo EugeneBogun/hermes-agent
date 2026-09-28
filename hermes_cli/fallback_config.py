@@ -37,7 +37,9 @@ def is_transient_provider_resolve_error(exc: BaseException) -> bool:
         getattr(socket, n) for n in ("EAI_NONAME", "EAI_AGAIN", "EAI_FAIL", "EAI_NODATA")
         if hasattr(socket, n)
     }
-    # Walk the cause chain; callers wrap raw transport errors.
+    # Walk the explicit ``raise ... from`` chain only (as auth_codex._is_transient_transport_error
+    # does). Following ``__context__`` would make a misconfiguration error that merely happened to be
+    # raised while handling a network error look transient and silently reroute it.
     seen: set[int] = set()
     cur: Optional[BaseException] = exc
     while cur is not None and id(cur) not in seen:
@@ -60,7 +62,7 @@ def is_transient_provider_resolve_error(exc: BaseException) -> bool:
         # Bare exceptions that carry the raw DNS text (format_runtime_provider_error).
         if any(needle in msg for needle in _DNS_FAILURE_NEEDLES):
             return True
-        cur = cur.__cause__ or cur.__context__
+        cur = cur.__cause__
     return False
 
 

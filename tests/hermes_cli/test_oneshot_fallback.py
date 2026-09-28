@@ -109,18 +109,26 @@ class TestResolveRuntimeWithFallback:
         with pytest.raises(httpx.ReadTimeout, match="primary unreachable"):
             resolve_runtime_with_fallback(_CFG, requested="nous")
 
-    def test_non_network_error_is_not_treated_as_unreachable(self, monkeypatch):
-        """An HTTP response the resolver chose not to map to AuthError is not a network failure and
-        keeps propagating as before."""
-        request = httpx.Request("POST", "https://portal.example/api/oauth/token")
-        status_exc = httpx.HTTPStatusError("boom", request=request, response=httpx.Response(500, request=request))
+    @pytest.mark.parametrize("primary_exc", [
+        ValueError("Unknown provider 'antropic'"),
+        httpx.HTTPStatusError("boom", request=httpx.Request("POST", "https://portal.example/api/oauth/token"),
+                              response=httpx.Response(500, request=httpx.Request("POST", "https://portal.example"))),
+    ], ids=["misconfiguration", "http-status-not-mapped-to-auth"])
+    def test_non_eligible_error_propagates_without_consulting_the_chain(self, monkeypatch, primary_exc):
+        """Pins the guard itself: asserting only that the primary error surfaces is not enough, since
+        an exhausted chain re-raises the primary too. The chain must never be walked (#81209)."""
+        calls = []
 
         def fake_resolve(**kw):
-            raise status_exc
+            calls.append(kw.get("requested"))
+            if kw.get("requested") == "nous":
+                raise primary_exc
+            return {"provider": kw["requested"]}
 
         monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", fake_resolve)
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(type(primary_exc)):
             resolve_runtime_with_fallback(_CFG, requested="nous")
+        assert calls == ["nous"]
 
 
 def test_primary_failure_wording_distinguishes_unreachable():
@@ -128,6 +136,29 @@ def test_primary_failure_wording_distinguishes_unreachable():
 
     assert primary_failure_wording(httpx.ReadTimeout("t")) == ("unreachable", "Primary provider unreachable")
     assert primary_failure_wording(AuthError("expired")) == ("auth failed", "Primary auth failed")
+
+
+def test_classifier_follows_explicit_cause_not_implicit_context():
+    """``raise X from transport_err`` is a wrapped network failure; an unrelated error that merely
+    happened to be raised while handling one (implicit ``__context__``) is not -- otherwise a
+    misconfiguration hit during a DNS blip would be silently rerouted."""
+    from hermes_cli.fallback_config import is_fallback_eligible_resolution_error
+
+    try:
+        try:
+            raise httpx.ConnectError("connection refused")
+        except httpx.ConnectError as exc:
+            raise RuntimeError("credential refresh failed") from exc
+    except RuntimeError as wrapped:
+        assert is_fallback_eligible_resolution_error(wrapped)
+
+    try:
+        try:
+            raise httpx.ConnectError("connection refused")
+        except httpx.ConnectError:
+            raise ValueError("provider 'p0' is disabled in config")
+    except ValueError as misconfig:
+        assert not is_fallback_eligible_resolution_error(misconfig)
 
 
 def test_cron_and_interactive_walkers_share_one_classifier():

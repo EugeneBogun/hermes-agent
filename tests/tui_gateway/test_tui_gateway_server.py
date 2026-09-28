@@ -19701,6 +19701,24 @@ class TestResolveRuntimeWithFallback:
         assert resolution.runtime == fallback_runtime
         assert resolution.used_fallback is True
 
+    def test_misconfiguration_propagates_without_consulting_the_chain(self, monkeypatch):
+        """Pins the guard: a non-auth, non-network error must not walk the fallback chain."""
+        def fake_resolve(**kwargs):
+            raise ValueError("Unknown provider 'antropic'")
+
+        def chain_must_not_be_read():
+            raise AssertionError("fallback chain consulted for a misconfiguration")
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            fake_resolve,
+        )
+        monkeypatch.setattr(server, "_load_fallback_model", chain_must_not_be_read)
+        import pytest
+
+        with pytest.raises(ValueError, match="antropic"):
+            server._resolve_runtime_with_fallback({"requested": "antropic"})
+
 
     def test_auth_error_skips_provider_only_fallback(self, monkeypatch):
         """Auth fallback requires one complete provider/model pair."""

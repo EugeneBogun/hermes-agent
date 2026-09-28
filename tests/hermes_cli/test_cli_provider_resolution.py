@@ -392,6 +392,27 @@ def test_fallback_runtime_labels_quota_outage_and_bad_credentials_distinctly(mon
     assert absent not in printed[-1]
 
 
+def test_fallback_runtime_never_reroutes_misconfiguration(monkeypatch, tmp_path):
+    """Pins the CLI guard: a misconfiguration returns None without touching the fallback chain."""
+    from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("cli._cprint", lambda *a, **k: None, raising=False)
+    resolved = []
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kw: resolved.append(kw) or {"provider": "custom", "base_url": "http://x/v1", "api_key": "k"},
+    )
+
+    shell = CLIAgentSetupMixin.__new__(CLIAgentSetupMixin)
+    shell._fallback_model = [{"provider": "custom", "model": "local-model"}]
+
+    assert shell._resolve_fallback_runtime(ValueError("Unknown provider 'antropic'")) is None
+    assert resolved == []
+
+
 def test_ensure_runtime_credentials_records_quota_vs_bad_key(monkeypatch, tmp_path):
     """Kanban workers need this flag: a quota wall at startup is not a worker failure (#117482)."""
     from hermes_cli.auth import AuthError
